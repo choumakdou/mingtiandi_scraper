@@ -447,6 +447,322 @@ async def run_scrape_core(
 # ===========================================================================
 
 
+class GuidedManualDialog:
+    """Walks the user through saving each article as a PDF in their own
+    default browser. The dialog polls the work folder for new PDFs and
+    auto-advances when one appears.
+
+    Lifecycle:
+      win.wait_window()  (in caller) -> result available via .result
+      .result = (saved_filenames, skipped_indices, stopped_early)
+    """
+
+    def __init__(self, parent, articles: list[dict], work_dir: str, log_cb):
+        self.parent = parent
+        self.articles = articles
+        self.work_dir = work_dir
+        self.log_cb = log_cb
+        self.current_idx = 0
+        self.saved_files: list[str] = []
+        self.skipped: list[int] = []
+        self.stopped = False
+        self.result: tuple[list[str], list[int], bool] = ([], [], False)
+
+        os.makedirs(work_dir, exist_ok=True)
+        self.existing_files = self._snapshot()
+
+        self.win = self.parent._tk.Toplevel(parent)
+        self.win.title("Guided Manual Save")
+        self.win.geometry("760x620")
+        self.win.minsize(640, 540)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self.win.protocol("WM_DELETE_WINDOW", self._on_stop)
+        # Bring to front
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(500, lambda: self.win.attributes("-topmost", False))
+
+        self._build()
+        self._open_current()
+        self._poll()
+
+    # ---------------------- helpers ----------------------
+    def _snapshot(self) -> set[str]:
+        try:
+            return set(os.listdir(self.work_dir))
+        except FileNotFoundError:
+            return set()
+
+    # ---------------------- UI build ----------------------
+    def _build(self):
+        tk = self.parent._tk
+        ttk = self.parent._ttk
+        pad = {"padx": 10, "pady": 4}
+
+        frm = ttk.Frame(self.win, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        # Header
+        self.header_var = tk.StringVar()
+        ttk.Label(
+            frm, textvariable=self.header_var, font=("Segoe UI", 13, "bold")
+        ).pack(anchor="w", **pad)
+
+        # Title
+        self.title_var = tk.StringVar()
+        ttk.Label(
+            frm,
+            textvariable=self.title_var,
+            font=("Segoe UI", 10),
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", fill="x", **pad)
+
+        # URL
+        self.url_var = tk.StringVar()
+        url_lbl = ttk.Label(
+            frm,
+            textvariable=self.url_var,
+            foreground="#0066cc",
+            wraplength=720,
+            justify="left",
+            cursor="hand2",
+        )
+        url_lbl.pack(anchor="w", fill="x", **pad)
+        url_lbl.bind("<Button-1>", lambda e: self._open_current())
+
+        # Folder + filename (the "save here" instructions)
+        box = ttk.LabelFrame(frm, text="📁  Save the PDF here", padding=8)
+        box.pack(fill="x", **pad)
+        ttk.Label(box, text="Folder:", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", padx=4, pady=2
+        )
+        self.folder_var = tk.StringVar(value=self.work_dir)
+        ttk.Entry(box, textvariable=self.folder_var).grid(
+            row=0, column=1, sticky="ew", padx=4, pady=2
+        )
+        ttk.Button(box, text="Copy", command=lambda: self._copy(self.work_dir)).grid(
+            row=0, column=2, padx=4, pady=2
+        )
+        ttk.Label(box, text="Filename:", font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=0, sticky="w", padx=4, pady=2
+        )
+        self.expected_var = tk.StringVar()
+        self.expected_entry = ttk.Entry(
+            box, textvariable=self.expected_var, font=("Consolas", 11, "bold"),
+            foreground="#0066cc",
+        )
+        self.expected_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
+        ttk.Button(
+            box, text="Copy", command=lambda: self._copy(self.expected_var.get())
+        ).grid(row=1, column=2, padx=4, pady=2)
+        box.columnconfigure(1, weight=1)
+
+        # Status
+        self.status_var = tk.StringVar(value="Waiting for you to save the PDF…")
+        ttk.Label(
+            frm,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10, "italic"),
+            foreground="#228B22",
+        ).pack(anchor="w", **pad)
+
+        # What to do
+        instr = ttk.LabelFrame(frm, text="What to do (in your browser)", padding=8)
+        instr.pack(fill="x", **pad)
+        for i, line in enumerate([
+            "1. Your default browser has opened the article above.",
+            "2. If Cloudflare shows a challenge, click the checkbox once.",
+            "3. Wait for the real article to load.",
+            "4. Press Ctrl+P (or File \u2192 Print).",
+            "5. Choose 'Save as PDF' as the destination.",
+            "6. Save with the exact filename above, into the folder above.",
+            "7. This dialog auto-advances when it sees the new file.",
+        ]):
+            ttk.Label(instr, text=line, justify="left").grid(
+                row=i, column=0, sticky="w", padx=4, pady=1
+            )
+
+        # Buttons
+        btn_frame = ttk.Frame(frm)
+        btn_frame.pack(fill="x", **pad)
+        ttk.Button(
+            btn_frame, text="\u23ed  Skip", command=self._on_skip
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            btn_frame, text="\ud83d\udd04  Reopen URL", command=self._open_current
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            btn_frame,
+            text="\ud83d\udcc1  I saved it under a different name",
+            command=self._on_browse,
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            btn_frame, text="\u2705  Done with this one", command=self._on_done
+        ).pack(side="right", padx=4)
+        ttk.Button(
+            btn_frame, text="\u23f9  Stop", command=self._on_stop
+        ).pack(side="right", padx=4)
+
+    # ---------------------- state updates ----------------------
+    def _update_labels(self):
+        art = self.articles[self.current_idx]
+        n = self.current_idx + 1
+        total = len(self.articles)
+        self.header_var.set(f"Article {n} of {total}")
+        self.title_var.set(art["title"])
+        self.url_var.set(art["url"])
+        self.expected_var.set(f"article_{n:02d}.pdf")
+        self.status_var.set("Waiting for you to save the PDF\u2026")
+
+    def _open_current(self):
+        art = self.articles[self.current_idx]
+        self._update_labels()
+        try:
+            webbrowser.open(art["url"])
+            self.log_cb(
+                f"[guided] Opened article {self.current_idx+1}/{len(self.articles)}: {art['title']}"
+            )
+        except Exception as e:
+            self.log_cb(f"[guided] webbrowser.open failed: {e}")
+        self.status_var.set(
+            "Browser opened. Solve the challenge (if any), then Ctrl+P, then save."
+        )
+
+    def _copy(self, text: str):
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text)
+            self.status_var.set(f"Copied: {text}")
+        except Exception:
+            pass
+
+    # ---------------------- file polling ----------------------
+    def _poll(self):
+        if not self._alive():
+            return
+        try:
+            current = self._snapshot()
+            new_pdfs = sorted(
+                f for f in (current - self.existing_files)
+                if f.lower().endswith(".pdf")
+            )
+            if new_pdfs:
+                self._wait_for_stable(new_pdfs[0])
+                return
+        except Exception as e:
+            self.log_cb(f"[guided] poll error: {e}")
+        self.win.after(1000, self._poll)
+
+    def _wait_for_stable(self, filename: str, prev_size: int = -1):
+        if not self._alive():
+            return
+        path = os.path.join(self.work_dir, filename)
+        if not os.path.exists(path):
+            self.win.after(1000, self._poll)
+            return
+        size = os.path.getsize(path)
+        if prev_size == -1:
+            self.win.after(1500, lambda: self._wait_for_stable(filename, size))
+            return
+        if size == prev_size and size > 1000:
+            # Stable, looks like a real PDF. Rename to the expected name
+            # (in case the user saved with a different one) and advance.
+            n = self.current_idx + 1
+            target = f"article_{n:02d}.pdf"
+            if filename != target:
+                target_path = os.path.join(self.work_dir, target)
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+                try:
+                    os.rename(path, target_path)
+                except Exception:
+                    shutil.move(path, target_path)
+                filename = target
+            self.status_var.set(
+                f"\u2705 Got {filename} \u2014 moving to the next article\u2026"
+            )
+            self.log_cb(f"[guided] Auto-detected: {filename}")
+            self._advance(filename)
+        else:
+            self.win.after(1500, lambda: self._wait_for_stable(filename, size))
+
+    # ---------------------- user actions ----------------------
+    def _on_done(self):
+        expected = f"article_{self.current_idx+1:02d}.pdf"
+        path = os.path.join(self.work_dir, expected)
+        if os.path.exists(path) and os.path.getsize(path) > 1000:
+            self._advance(expected)
+        else:
+            self.status_var.set(
+                f"\u274c {expected} not found in folder. Save it first, then click Done."
+            )
+
+    def _on_skip(self):
+        self.skipped.append(self.current_idx)
+        self.log_cb(
+            f"[guided] Skipped article {self.current_idx+1}/{len(self.articles)}"
+        )
+        self._advance(None)
+
+    def _on_browse(self):
+        path = self.parent._filedialog.askopenfilename(
+            title="Pick the PDF you just saved",
+            initialdir=self.work_dir,
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        target = os.path.join(
+            self.work_dir, f"article_{self.current_idx+1:02d}.pdf"
+        )
+        if os.path.normcase(path) != os.path.normcase(target):
+            if os.path.exists(target):
+                os.remove(target)
+            try:
+                os.rename(path, target)
+            except Exception:
+                shutil.move(path, target)
+        self._advance(f"article_{self.current_idx+1:02d}.pdf")
+
+    def _on_stop(self):
+        self.stopped = True
+        # Capture whatever was saved so the caller can still combine
+        self.result = (self.saved_files, self.skipped, True)
+        self.status_var.set("Stopping\u2026")
+        self.win.destroy()
+
+    def _advance(self, saved_file: Optional[str]):
+        if saved_file:
+            self.saved_files.append(saved_file)
+        self.current_idx += 1
+        if self.current_idx >= len(self.articles):
+            # all done
+            self.result = (self.saved_files, self.skipped, False)
+            self.win.destroy()
+            return
+        self.existing_files = self._snapshot()
+        self._open_current()
+        self._poll()
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except Exception:
+            return False
+
+    def wait(self):
+        """Block until the dialog is closed. Returns .result."""
+        try:
+            self.win.wait_window()
+        except Exception:
+            pass
+        if self.stopped and not self.saved_files and not self.skipped:
+            self.result = ([], [], True)
+        return self.result
+
+
 class ScraperGUI:
     """Tkinter GUI. Routes print/log output through self._log."""
 
@@ -477,13 +793,20 @@ class ScraperGUI:
 
         self.excel_var = tk.StringVar(value=default_xlsx)
         self.output_dir_var = tk.StringVar(value=default_out)
+        self.pdfs_dir_var = tk.StringVar(value=default_out)
         self.chrome_var = tk.StringVar(value=find_chrome_path() or "")
         self.filename_var = tk.StringVar(value="bobby_mak_quotes.pdf")
         self.watch_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready.")
         self.progress_var = tk.DoubleVar(value=0.0)
+        # v4: mode selector
+        self.mode_var = tk.StringVar(value="guided")  # default to guided (Cloudflare-friendly)
+        # v4: where the GuidedManualDialog writes user-saved PDFs
+        self.guided_pdfs_dir: Optional[str] = None
 
         self._build_ui()
+        # Trigger initial enable/disable of PDFs folder field
+        self.root.after(50, self._on_mode_change)
         self.root.after(100, self._drain_log_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -514,12 +837,37 @@ class ScraperGUI:
         ).pack(side="left")
         ttk.Label(
             title,
-            text="v3 — picks articles from Excel, prints each to PDF, highlights the quote",
+            text="v4 — pick a mode, then Start",
             foreground="#666",
         ).pack(side="left", padx=12)
 
+        # v4: Mode selector
+        mode_frm = ttk.LabelFrame(root, text="1.  Choose a mode", padding=10)
+        mode_frm.pack(fill="x", padx=12, pady=6)
+        ttk.Radiobutton(
+            mode_frm,
+            text="🤖  Auto scrape  — try to load each article in headless Chrome (may be blocked by Cloudflare)",
+            variable=self.mode_var,
+            value="auto",
+            command=self._on_mode_change,
+        ).pack(anchor="w", padx=4, pady=2)
+        ttk.Radiobutton(
+            mode_frm,
+            text="🖐  Guided manual  — I open each article in MY browser, save as PDF, the tool does the rest (recommended when Cloudflare is blocking)",
+            variable=self.mode_var,
+            value="guided",
+            command=self._on_mode_change,
+        ).pack(anchor="w", padx=4, pady=2)
+        ttk.Radiobutton(
+            mode_frm,
+            text="📄  Combine saved PDFs  — I already saved the article PDFs, just stitch them into one",
+            variable=self.mode_var,
+            value="chop",
+            command=self._on_mode_change,
+        ).pack(anchor="w", padx=4, pady=2)
+
         # File picker section
-        frm = ttk.LabelFrame(root, text="1.  Pick your inputs", padding=10)
+        frm = ttk.LabelFrame(root, text="2.  Pick your inputs", padding=10)
         frm.pack(fill="x", padx=12, pady=6)
         frm.columnconfigure(1, weight=1)
 
@@ -538,8 +886,18 @@ class ScraperGUI:
         ttk.Label(frm, text="Output filename:").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(frm, textvariable=self.filename_var).grid(row=2, column=1, sticky="ew", **pad)
 
+        # v4: PDFs folder (used only in "Combine" mode)
+        self.pdfs_dir_label = ttk.Label(frm, text="PDFs folder:")
+        self.pdfs_dir_label.grid(row=3, column=0, sticky="w", **pad)
+        self.pdfs_dir_entry = ttk.Entry(frm, textvariable=self.pdfs_dir_var)
+        self.pdfs_dir_entry.grid(row=3, column=1, sticky="ew", **pad)
+        self.pdfs_dir_btn = ttk.Button(
+            frm, text="Browse…", command=self._browse_pdfs_dir
+        )
+        self.pdfs_dir_btn.grid(row=3, column=2, **pad)
+
         # Options section
-        opt = ttk.LabelFrame(root, text="2.  Options", padding=10)
+        opt = ttk.LabelFrame(root, text="3.  Options", padding=10)
         opt.pack(fill="x", padx=12, pady=6)
         opt.columnconfigure(1, weight=1)
 
@@ -569,6 +927,11 @@ class ScraperGUI:
             act, text="■  Stop", command=self._on_stop, width=14, state="disabled"
         )
         self.stop_btn.pack(side="left", padx=4)
+        self.combine_btn = ttk.Button(
+            act, text="🔁  Re-combine saved PDFs",
+            command=self._on_recombine, width=28,
+        )
+        self.combine_btn.pack(side="left", padx=4)
         ttk.Button(act, text="📂  Open output folder", command=self._open_output).pack(
             side="right", padx=4
         )
@@ -588,7 +951,7 @@ class ScraperGUI:
         self.progress.pack(fill="x", padx=2, pady=(2, 4))
 
         # Log area
-        log_frame = ttk.LabelFrame(root, text="3.  Log", padding=4)
+        log_frame = ttk.LabelFrame(root, text="4.  Log", padding=4)
         log_frame.pack(fill="both", expand=True, padx=12, pady=6)
         self.log_text = self._tk.scrolledtext.ScrolledText(
             log_frame,
@@ -617,7 +980,39 @@ class ScraperGUI:
         path = self._filedialog.askdirectory(title="Pick the output folder")
         if path:
             self.output_dir_var.set(path)
+            # also default the PDFs folder to the same place
+            self.pdfs_dir_var.set(path)
             self._log(f"Output folder: {path}")
+
+    def _browse_pdfs_dir(self):
+        path = self._filedialog.askdirectory(title="Pick the folder containing the saved article PDFs")
+        if path:
+            self.pdfs_dir_var.set(path)
+            self._log(f"PDFs folder: {path}")
+
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        # PDFs folder row is meaningful only in "chop" mode
+        state_pdfs = "normal" if mode == "chop" else "disabled"
+        try:
+            self.pdfs_dir_label.configure(state=state_pdfs)
+            self.pdfs_dir_entry.configure(state=state_pdfs)
+            self.pdfs_dir_btn.configure(state=state_pdfs)
+        except Exception:
+            pass
+        # Chrome path + "show browser" are only used in auto mode
+        # (we don't disable the widgets — users may want to know)
+        # Update the title description
+        descriptions = {
+            "auto": "Auto scrape — headless Chrome will try to load every article",
+            "guided": "Guided manual — Chrome opens for you, you Ctrl+P each, the tool combines",
+            "chop": "Combine — pick a folder of PDFs you already saved and we'll stitch them",
+        }
+        for child in self.root.winfo_children():
+            if isinstance(child, ttk.Frame if False else self._ttk.Frame):  # ttk.Frame
+                pass
+        # Reset the second section's label frame text
+        # (We use a static label here; the mode radio descriptions are the source of truth.)
 
     def _auto_detect_chrome(self):
         path = find_chrome_path()
@@ -681,13 +1076,8 @@ class ScraperGUI:
     def _on_start(self):
         if self.worker and self.worker.is_alive():
             return
-        excel = self.excel_var.get().strip()
+        mode = self.mode_var.get()
         out_folder = self.output_dir_var.get().strip()
-        if not excel or not os.path.exists(excel):
-            self._messagebox.showerror(
-                "Missing Excel", "Please pick the articles Excel file first."
-            )
-            return
         if not out_folder:
             self._messagebox.showerror(
                 "Missing output folder", "Please pick where to save the PDF."
@@ -696,37 +1086,51 @@ class ScraperGUI:
         os.makedirs(out_folder, exist_ok=True)
         output_pdf = self._resolve_output_path()
 
-        try:
-            articles = read_articles(excel)
-        except Exception as e:
-            self._messagebox.showerror(
-                "Excel error", f"Could not read Excel:\n{e}"
-            )
-            return
-        if not articles:
-            self._messagebox.showerror(
-                "No articles", "The Excel has no articles in column B."
-            )
-            return
+        if mode in ("auto", "guided"):
+            excel = self.excel_var.get().strip()
+            if not excel or not os.path.exists(excel):
+                self._messagebox.showerror(
+                    "Missing Excel", "Please pick the articles Excel file first."
+                )
+                return
+            try:
+                articles = read_articles(excel)
+            except Exception as e:
+                self._messagebox.showerror(
+                    "Excel error", f"Could not read Excel:\n{e}"
+                )
+                return
+            if not articles:
+                self._messagebox.showerror(
+                    "No articles", "The Excel has no articles in column B."
+                )
+                return
+        else:  # chop
+            articles = []
 
-        # Lock the UI
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.cancel_evt.clear()
         self.progress_var.set(0)
-        self._set_status(f"Starting… ({len(articles)} articles)", 0.0)
         self.output_pdf_path = output_pdf
 
-        # Snapshot of settings for the worker
+        if mode == "auto":
+            self._set_status(f"Starting… ({len(articles)} articles)", 0.0)
+            self._start_auto_scrape(articles, output_pdf)
+        elif mode == "guided":
+            self._set_status("Guided mode — opening Chrome to article 1", 0.0)
+            self._start_guided(articles, output_pdf)
+        else:  # chop
+            self._set_status("Combining saved PDFs…", 0.0)
+            self._start_chop_only(output_pdf)
+
+    # ----- mode: auto -----
+    def _start_auto_scrape(self, articles: list[dict], output_pdf: str):
         chrome_path = self.chrome_var.get().strip() or None
         headless = not self.watch_var.get()
-        watch = self.watch_var.get()
 
         def worker():
             try:
-                # If "watch" is checked, run a one-arg lambda that prints to
-                # the GUI in real time. Otherwise, suppress Playwright's
-                # own console by redirecting to the GUI logger.
                 def gui_log(msg: str):
                     self._log(msg)
 
@@ -750,7 +1154,10 @@ class ScraperGUI:
                     self._log(f"\n[OK] Saved: {result}")
                     self.output_pdf_path = result
                 else:
-                    self._set_status("Stopped (no PDF written)", self.progress_var.get() / 100.0)
+                    self._set_status(
+                        "Stopped (no PDF written)",
+                        self.progress_var.get() / 100.0,
+                    )
             except Exception as e:
                 self._log(f"\n[!] Fatal error: {e}")
                 self._set_status("Error", None)
@@ -761,11 +1168,212 @@ class ScraperGUI:
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
+    # ----- mode: guided -----
+    def _start_guided(self, articles: list[dict], output_pdf: str):
+        # Create the folder where the modal will collect PDFs
+        guided_dir = os.path.join(
+            self.output_dir_var.get().strip() or ".", "bobby_pdfs"
+        )
+        os.makedirs(guided_dir, exist_ok=True)
+        self.guided_pdfs_dir = guided_dir
+        self._log(f"[*] Guided mode — PDFs will be saved into: {guided_dir}")
+        # Open the modal; it walks the user through 19 articles
+        dlg = GuidedManualDialog(
+            parent=self.root,
+            articles=articles,
+            work_dir=guided_dir,
+            log_cb=self._log,
+        )
+        self._set_status("Guided mode — waiting for you to save PDFs…", 0.0)
+        # When the modal closes, run the combine step
+        def on_modal_close():
+            saved, skipped, stopped = dlg.result
+            self._log(
+                f"[guided] Done. saved={len(saved)}, skipped={len(skipped)}, stopped={stopped}"
+            )
+            if not saved:
+                self._set_status(
+                    "No PDFs saved — nothing to combine.",
+                    self.progress_var.get() / 100.0,
+                )
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                return
+            # Run the chop pipeline in a worker thread
+            def combine_worker():
+                try:
+                    self._set_status(
+                        f"Combining {len(saved)} PDFs into the final PDF…",
+                        0.05,
+                    )
+                    out = self._run_chop_pipeline(
+                        guided_dir,
+                        output_pdf,
+                        log_cb=self._log,
+                        progress_cb=self._set_status,
+                    )
+                    if out:
+                        self._set_status("Done ✓", 1.0)
+                        self._log(f"\n[OK] Final PDF: {out}")
+                        self.output_pdf_path = out
+                except Exception as e:
+                    self._log(f"\n[!] Combine failed: {e}")
+                    self._set_status("Combine error", None)
+                finally:
+                    self.start_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+
+            self.worker = threading.Thread(target=combine_worker, daemon=True)
+            self.worker.start()
+
+        # wait_window is non-blocking in Tk; we poll
+        def poll_modal():
+            try:
+                if dlg.win.winfo_exists():
+                    self.root.after(200, poll_modal)
+                else:
+                    on_modal_close()
+            except Exception:
+                on_modal_close()
+        self.root.after(200, poll_modal)
+
+    # ----- mode: chop only -----
+    def _start_chop_only(self, output_pdf: str):
+        pdfs_dir = self.pdfs_dir_var.get().strip()
+        if not pdfs_dir or not os.path.isdir(pdfs_dir):
+            self._messagebox.showerror(
+                "Missing PDFs folder",
+                "Please pick a folder containing the saved article PDFs.",
+            )
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            return
+
+        def worker():
+            try:
+                out = self._run_chop_pipeline(
+                    pdfs_dir,
+                    output_pdf,
+                    log_cb=self._log,
+                    progress_cb=self._set_status,
+                )
+                if out:
+                    self._set_status("Done ✓", 1.0)
+                    self._log(f"\n[OK] Final PDF: {out}")
+                    self.output_pdf_path = out
+            except Exception as e:
+                self._log(f"\n[!] Combine failed: {e}")
+                self._set_status("Combine error", None)
+            finally:
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+
+    def _on_recombine(self):
+        """Combine the PDFs from the most recent guided run (or pick a folder)."""
+        folder = self.guided_pdfs_dir
+        if not folder or not os.path.isdir(folder):
+            folder = self._filedialog.askdirectory(
+                title="Pick the folder of saved article PDFs"
+            )
+            if not folder:
+                return
+        output_pdf = self._resolve_output_path()
+        if self.worker and self.worker.is_alive():
+            self._log("[!] A job is already running.")
+            return
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.progress_var.set(0)
+        self._set_status("Re-combining…", 0.0)
+
+        def worker():
+            try:
+                out = self._run_chop_pipeline(
+                    folder,
+                    output_pdf,
+                    log_cb=self._log,
+                    progress_cb=self._set_status,
+                )
+                if out:
+                    self._set_status("Done ✓", 1.0)
+                    self._log(f"\n[OK] Final PDF: {out}")
+                    self.output_pdf_path = out
+            except Exception as e:
+                self._log(f"\n[!] Combine failed: {e}")
+                self._set_status("Combine error", None)
+            finally:
+                self.start_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+
+    # ----- shared: chop pipeline (no Playwright, just PDFs) -----
+    def _run_chop_pipeline(
+        self,
+        pdfs_dir: str,
+        output_pdf: str,
+        log_cb=None,
+        progress_cb=None,
+    ) -> Optional[str]:
+        def log(msg: str):
+            if log_cb:
+                log_cb(msg)
+            else:
+                print(msg, flush=True)
+
+        log(f"[*] Scanning {pdfs_dir} for PDFs…")
+        pdf_files = sorted(
+            os.path.join(pdfs_dir, f)
+            for f in os.listdir(pdfs_dir)
+            if f.lower().endswith(".pdf")
+        )
+        if not pdf_files:
+            log(f"[!] No PDF files in {pdfs_dir}")
+            return None
+        log(f"[*] Found {len(pdf_files)} PDF(s)")
+
+        a4_pages: list[Image.Image] = []
+        for i, pdf_path in enumerate(pdf_files, 1):
+            log(f"  [{i}/{len(pdf_files)}] {os.path.basename(pdf_path)}")
+            bobby = find_bobby_mak_in_pdf(pdf_path)
+            if bobby is None:
+                log("      [!] No 'Bobby Mak' line found in text — page will still be cropped to A4")
+            else:
+                log(f"      Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
+            a4 = make_a4_page_from_pdf(pdf_path, bobby)
+            if a4 is not None:
+                a4_pages.append(a4)
+            if progress_cb:
+                progress_cb(0.1 + 0.85 * i / len(pdf_files))
+        if not a4_pages:
+            log("[!] No pages produced.")
+            return None
+        log(f"[*] Combining {len(a4_pages)} A4 pages into {output_pdf}…")
+        a4_pages[0].save(
+            output_pdf,
+            save_all=True,
+            append_images=a4_pages[1:],
+            resolution=150.0,
+            quality=88,
+        )
+        if progress_cb:
+            progress_cb(1.0)
+        log(f"[OK] Final PDF: {output_pdf}  ({len(a4_pages)} pages)")
+        return output_pdf
+
     def _on_stop(self):
         if self.worker and self.worker.is_alive():
             self.cancel_evt.set()
             self._log("[!] Stop requested — finishing current article…")
             self.stop_btn.configure(state="disabled")
+        # If a guided dialog is open, close it too
+        for child in self.root.winfo_children():
+            if isinstance(child, self._tk.Toplevel) and child.winfo_title() == "Guided Manual Save":
+                child.destroy()
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():

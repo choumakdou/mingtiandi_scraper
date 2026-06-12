@@ -1,47 +1,96 @@
-# Mingtiandi Bobby Mak Quote PDF Builder (v3 — GUI edition)
+# Mingtiandi Bobby Mak Quote PDF Builder (v4 — Guided Manual edition)
 
 A single tool that turns a list of Mingtiandi article URLs into a single
 A4-portrait PDF — one page per article, with the Mingtiandi masthead
 preserved and the paragraph where **Bobby Mak (CHFT Advisory)** is
 quoted highlighted in yellow.
 
-## What's new in v3
+## What's new in v4
 
-- **GUI mode (default)** — when you double-click the `.exe` (or run
-  `python mingtiandi_scraper.py` with no args), you get a proper
-  Tkinter window with:
-  - File picker for the Excel
-  - Folder picker for the output
-  - Chrome path field with auto-detect
-  - "Show the browser" checkbox
-  - **Start** / **Stop** buttons
-  - **Live log** streaming the progress
-  - Progress bar + status line
-  - "Open output folder" button at the end
-- **CLI mode (unchanged)** — all previous flags still work
-- **Stop button** actually cancels mid-article
+- **Three modes** (radio buttons at the top of the GUI):
+  - **🤖 Auto scrape** — headless Chrome tries to load every article
+    (works when Cloudflare isn't blocking your IP)
+  - **🖐 Guided manual** *(default)* — your default browser opens to
+    each article in turn, you do `Ctrl+P` → "Save as PDF", the tool
+    watches the folder and **auto-advances** when it sees the new file,
+    then crops + combines everything at the end
+  - **📄 Combine saved PDFs** — you already have the article PDFs,
+    just stitch them into one
+- **Re-combine button** — re-runs the chop pipeline on the most recent
+  guided-run folder (or any folder you pick)
+- **PDFs folder field** — only enabled in Combine mode
+- **Status bar** shows the current mode and progress in plain English
+- **Live log** still streams every step
 
-## Quick start
+## v4 is for you if Cloudflare is blocking the headless scraper
 
-### GUI (easiest)
+If Auto mode keeps saying "Cloudflare never cleared" because your home
+IP got a low Trust Score, switch to **Guided manual** (already the
+default). It bypasses automation detection entirely because *you* open
+each article in your own Chrome — the script just helps you do the
+filing and the cropping.
 
-1. Double-click `mingtiandi_scraper.exe` (Windows) or run `./mingtiandi_scraper` (macOS).
-2. Click **Browse…** next to *Excel file* → pick `articles.xlsx`.
-3. Click **Browse…** next to *Output folder* → pick where to save the PDF.
-4. (Optional) tick **Show the browser** if you want to watch Chrome
-   work, or click **Auto-detect** next to *Chrome path*.
-5. Click **▶ Start**. Watch the log fill up, the bar advance, the
-   status line tell you which article is being processed.
-6. When done, click **📂 Open output folder** to grab the PDF.
+## Quick start (v4, recommended)
 
-### CLI (for cron / CI)
+1. **Double-click `mingtiandi_scraper.exe`**.
+2. Make sure **🖐 Guided manual** is selected (it is by default).
+3. **Browse…** next to *Output folder* → pick where to save the final
+   PDF. A subfolder called `bobby_pdfs\` will be created there for the
+   19 intermediate files.
+4. **Browse…** next to *Excel file* → pick `articles.xlsx`.
+5. Click **▶ Start**. A dialog opens, your default browser pops up
+   with article 1. The dialog tells you:
+   - the exact filename to use (`article_01.pdf`)
+   - the exact folder to save it in (with one-click Copy buttons)
+   - the 7 steps to follow in your browser
+6. **In Chrome**: solve any Cloudflare challenge → `Ctrl+P` → "Save as
+   PDF" → save with the exact filename in the exact folder.
+7. The dialog **auto-advances** the moment it sees the new file. Repeat
+   for the remaining 18.
+8. When all 19 are saved, the tool **automatically** runs the
+   crop-highlight-combine pipeline. Watch the log and progress bar.
+9. **📂 Open output folder** appears when the final PDF is ready.
 
+If you make a mistake, use:
+- **⏭ Skip** — move on without a PDF for this article
+- **🔄 Reopen URL** — re-open the article in your browser
+- **📁 I saved it under a different name** — pick the file you saved
+  and the tool will rename + place it
+- **⏹ Stop** — finish early, the tool will still combine whatever was
+  saved so far
+
+## Quick start (Combine mode)
+
+If you already have the 19 PDFs saved somewhere:
+
+1. Pick **📄 Combine saved PDFs** in the Mode section.
+2. The **PDFs folder** field is now enabled. **Browse…** to the folder
+   containing the PDFs.
+3. Pick the **Output folder** and **Output filename** for the final PDF.
+4. **▶ Start**. The tool runs the chop pipeline and reports progress
+   in the log.
+
+CLI equivalent:
 ```bash
-mingtiandi_scraper.exe --input articles.xlsx --output output.pdf
-mingtiandi_scraper.exe --input articles.xlsx --output output.pdf \
-    --chrome "C:\Program Files\Google\Chrome\Application\chrome.exe"
-mingtiandi_scraper.exe --mode pdf-chop --pdf-input ./saved_pdfs/ --output out.pdf
+mingtiandi_scraper.exe --mode pdf-chop --pdf-input "C:\path\to\pdfs" --output out.pdf
 ```
+
+## How the cropping works (unchanged from v3)
+
+1. `page.pdf()` (Chrome's print engine, viewport-independent) saves the
+   article to a raw PDF.
+2. CSS injected before printing hides ads / sidebar / footer.
+3. `pdfplumber` locates the **Bobby Mak** text by coordinates.
+4. The page is rendered to a 200 DPI image and cropped to one A4
+   portrait page, focused around the quote.
+5. All 19 A4 images are stacked into the final PDF.
+
+## How the paywall bypass works (unchanged from v3)
+
+- Uses your real Chrome (auto-detected) — not a stripped-down Chromium.
+- Sets a normal User-Agent, real viewport, real locale.
+- New `BrowserContext` per URL → fresh cookie jar → the 5-articles-per-month
+  paywall meter is reset every time.
 
 ## Excel format
 
@@ -51,24 +100,6 @@ mingtiandi_scraper.exe --mode pdf-chop --pdf-input ./saved_pdfs/ --output out.pd
 
 Row 1 is the header. Each row is one article. The bundled `articles.xlsx`
 has all 19 Bobby Mak articles pre-filled.
-
-## How it bypasses Cloudflare
-
-- Uses your real Chrome (auto-detected) — not a stripped-down Chromium
-- Sets a normal User-Agent, real viewport, real locale
-- New `BrowserContext` per URL → fresh cookie jar → the 5-articles-per-month
-  paywall meter is reset every time (this is the "anonymous mode" trick)
-- Waits up to 120s for Cloudflare's Turnstile to clear
-
-## How the cropping works
-
-1. `page.pdf()` (Chrome's print engine, viewport-independent) saves the
-   article to a raw PDF.
-2. CSS injected before printing hides ads / sidebar / footer.
-3. `pdfplumber` locates the **Bobby Mak** text by coordinates.
-4. The page is rendered to a 200 DPI image and cropped to one A4
-   portrait page, focused around the quote.
-5. All 19 A4 images are stacked into the final PDF.
 
 ## Build the `.exe` yourself (no GitHub)
 
@@ -83,14 +114,13 @@ pyinstaller --onefile --name mingtiandi_scraper mingtiandi_scraper.py
 
 This repo includes `.github/workflows/build.yml`. Push to `main` and
 the Actions tab will produce `mingtiandi_scraper-windows` and
-`mingtiandi_scraper-macos` artifacts. The current run is at:
-`https://github.com/choumakdou/mingtiandi_scraper/actions`
+`mingtiandi_scraper-macos` artifacts.
 
 ## Files in this repo
 
 ```
 mingtiandi_scraper/
-├── mingtiandi_scraper.py     # the tool (single file, GUI + CLI + core)
+├── mingtiandi_scraper.py     # the tool (single file, GUI + CLI + core + GuidedManualDialog)
 ├── requirements.txt          # pip deps (no GUI deps needed — tkinter is stdlib)
 ├── README.md                 # this file
 ├── articles.xlsx             # 19 articles
