@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows + macOS EXE
 
 on:
   push:
@@ -7,7 +7,13 @@ on:
 
 jobs:
   build-windows:
+    name: build-windows
     runs-on: windows-latest
+    defaults:
+      run:
+        # Use Git Bash so POSIX line-continuations (\) and backslashes work
+        # consistently. No more PowerShell parser confusion.
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,19 +23,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pyinstaller
           python -m playwright install chromium
 
-      - name: Build EXE with PyInstaller
+      - name: Build Windows EXE with PyInstaller
         run: |
-          pyinstaller --onefile --name mingtiandi_scraper ^
-            --add-data "requirements.txt;." ^
-            mingtiandi_scraper.py
+          pyinstaller --onefile --name mingtiandi_scraper --add-data "requirements.txt;." mingtiandi_scraper.py
 
-      - name: Upload artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: mingtiandi_scraper-windows
@@ -38,19 +43,35 @@ jobs:
           retention-days: 30
 
   build-macos:
+    name: build-macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install Python dependencies
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # PyInstaller is needed on macOS too (the platform-marker in
+          # requirements.txt restricts it to Windows only).
+          pip install pyinstaller
           python -m playwright install chromium
-      - run: |
-          pyinstaller --onefile --name mingtiandi_scraper mingtiandi_scraper.py
-      - uses: actions/upload-artifact@v4
+
+      - name: Build macOS binary with PyInstaller
+        run: |
+          # On macOS/Linux the PyInstaller --add-data separator is ':'
+          pyinstaller --onefile --name mingtiandi_scraper --add-data "requirements.txt:." mingtiandi_scraper.py
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
         with:
           name: mingtiandi_scraper-macos
           path: dist/mingtiandi_scraper
+          if-no-files-found: error
+          retention-days: 30
