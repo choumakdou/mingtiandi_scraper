@@ -1,37 +1,47 @@
-# Mingtiandi Bobby Mak Quote PDF Builder
+# Mingtiandi Bobby Mak Quote PDF Builder (v3 — GUI edition)
 
-A single Python tool that turns a list of Mingtiandi article URLs into a
-single A4-portrait PDF — one page per article, with the Mingtiandi
-masthead preserved and the paragraph where **Bobby Mak (CHFT Advisory)**
-is quoted highlighted in yellow.
+A single tool that turns a list of Mingtiandi article URLs into a single
+A4-portrait PDF — one page per article, with the Mingtiandi masthead
+preserved and the paragraph where **Bobby Mak (CHFT Advisory)** is
+quoted highlighted in yellow.
 
-## Why this script exists
+## What's new in v3
 
-Mingtiandi sits behind a **Cloudflare Turnstile** managed challenge that
-detects headless browsers from datacenter IPs (and from this assistant's
-sandbox). When the same code runs on your laptop with your real Chrome
-and your real residential IP, the challenge auto-solves in a couple of
-seconds and you get genuine screenshots with the real photos, the real
-header, and the full story.
+- **GUI mode (default)** — when you double-click the `.exe` (or run
+  `python mingtiandi_scraper.py` with no args), you get a proper
+  Tkinter window with:
+  - File picker for the Excel
+  - Folder picker for the output
+  - Chrome path field with auto-detect
+  - "Show the browser" checkbox
+  - **Start** / **Stop** buttons
+  - **Live log** streaming the progress
+  - Progress bar + status line
+  - "Open output folder" button at the end
+- **CLI mode (unchanged)** — all previous flags still work
+- **Stop button** actually cancels mid-article
 
-## Features
+## Quick start
 
-- **One command, one PDF**: reads the Excel, visits all URLs, screenshots
-  each, highlights the quote, outputs a single A4-portrait PDF.
-- **Authentic header**: keeps Mingtiandi's own masthead (no fake
-  reconstruction).
-- **Highlight**: the `Bobby Mak` paragraph is wrapped in yellow
-  background with a gold left border.
-- **Crops intelligently**: keeps the header + article title + the
-  highlighted paragraph + enough context, all on a single A4 page per
-  article.
-- **No paywall getting in the way**: opens a fresh Chrome **context** for
-  every URL, so the 5-articles-per-month cookie meter is reset each
-  time (the "use anonymous mode" trick from the brief).
-- **Two modes**:
-  - `scrape` — visit the live URLs.
-  - `pdf-chop` — process PDFs you already saved from the browser
-    (e.g. via *Print → Save as PDF*).
+### GUI (easiest)
+
+1. Double-click `mingtiandi_scraper.exe` (Windows) or run `./mingtiandi_scraper` (macOS).
+2. Click **Browse…** next to *Excel file* → pick `articles.xlsx`.
+3. Click **Browse…** next to *Output folder* → pick where to save the PDF.
+4. (Optional) tick **Show the browser** if you want to watch Chrome
+   work, or click **Auto-detect** next to *Chrome path*.
+5. Click **▶ Start**. Watch the log fill up, the bar advance, the
+   status line tell you which article is being processed.
+6. When done, click **📂 Open output folder** to grab the PDF.
+
+### CLI (for cron / CI)
+
+```bash
+mingtiandi_scraper.exe --input articles.xlsx --output output.pdf
+mingtiandi_scraper.exe --input articles.xlsx --output output.pdf \
+    --chrome "C:\Program Files\Google\Chrome\Application\chrome.exe"
+mingtiandi_scraper.exe --mode pdf-chop --pdf-input ./saved_pdfs/ --output out.pdf
+```
 
 ## Excel format
 
@@ -39,99 +49,50 @@ header, and the full story.
 | --- | --- |
 | `<title>\n<YYYY/MM/DD>` | full article URL |
 
-Row 1 is treated as the header and skipped. The script used in the
-deliverable reads `articles.xlsx` from the brief.
+Row 1 is the header. Each row is one article. The bundled `articles.xlsx`
+has all 19 Bobby Mak articles pre-filled.
 
-## Install & run (dev mode)
+## How it bypasses Cloudflare
+
+- Uses your real Chrome (auto-detected) — not a stripped-down Chromium
+- Sets a normal User-Agent, real viewport, real locale
+- New `BrowserContext` per URL → fresh cookie jar → the 5-articles-per-month
+  paywall meter is reset every time (this is the "anonymous mode" trick)
+- Waits up to 120s for Cloudflare's Turnstile to clear
+
+## How the cropping works
+
+1. `page.pdf()` (Chrome's print engine, viewport-independent) saves the
+   article to a raw PDF.
+2. CSS injected before printing hides ads / sidebar / footer.
+3. `pdfplumber` locates the **Bobby Mak** text by coordinates.
+4. The page is rendered to a 200 DPI image and cropped to one A4
+   portrait page, focused around the quote.
+5. All 19 A4 images are stacked into the final PDF.
+
+## Build the `.exe` yourself (no GitHub)
 
 ```bash
-# 1. Install Python 3.10+ from python.org (or use uv / pyenv / etc.)
-
-# 2. Clone or download this folder, then:
-cd mingtiandi_scraper
 pip install -r requirements.txt
-python -m playwright install chromium
-
-# 3. Run
-python mingtiandi_scraper.py --input articles.xlsx --output output.pdf
-```
-
-By default it tries to auto-detect your Chrome. If it can't, pass the
-path explicitly:
-
-```bash
-python mingtiandi_scraper.py --input articles.xlsx --output output.pdf \
-    --chrome "C:\Program Files\Google\Chrome\Application\chrome.exe"
-```
-
-### Other flags
-
-| Flag | Meaning |
-| --- | --- |
-| `--no-headless` | Show the Chrome windows as it works (handy for debugging). |
-| `--mode pdf-chop --pdf-input <dir>` | Use saved PDFs instead of scraping. |
-| `--user-agent "..."` | Override the User-Agent string. |
-
-## Building a Windows `.exe` via GitHub Actions
-
-This repo includes `.github/workflows/build.yml` that builds a single
-`.exe` on every push to `main` (and on manual trigger).
-
-1. Create a new GitHub repo, push this folder.
-2. Open the **Actions** tab → pick the *Build Windows EXE* run.
-3. Download the `mingtiandi_scraper-windows` artifact at the bottom of
-   the run — that's your `mingtiandi_scraper.exe`.
-
-Run it on your machine:
-
-```bat
-mingtiandi_scraper.exe --input articles.xlsx --output output.pdf
-```
-
-### Building locally with PyInstaller
-
-```bash
 pip install pyinstaller
 pyinstaller --onefile --name mingtiandi_scraper mingtiandi_scraper.py
-# Result: dist/mingtiandi_scraper.exe (Windows) or dist/mingtiandi_scraper (macOS/Linux)
+# dist/mingtiandi_scraper.exe
 ```
 
-## Will this bypass Cloudflare when run locally?
+## Build via GitHub Actions
 
-**Yes, in the vast majority of cases.** Reasons:
-
-1. Your IP is residential, not a known datacenter range.
-2. Your Chrome has real cookies, real cache, real history — the
-   Turnstile fingerprint heuristics all look like a normal user.
-3. The script does **not** set `navigator.webdriver`, does not run in a
-   contrived "no-extension" state, and uses your real Chrome binary,
-   not a stripped-down Chromium build.
-4. Even on the rare first-visit case where Cloudflare shows a checkbox
-   challenge, the script waits up to 120 seconds for it to auto-clear
-   before continuing.
-
-If a particular article still gets stuck on the challenge, simply open
-it in your own browser once to pass the Turnstile, then re-run the
-script — the cookie will be picked up.
-
-## Limitations
-
-- **Ads are not auto-removed.** The current crop keeps everything
-  between the masthead and the end of the article body. If you want
-  sidebar / "Related articles" blocks hidden, file a small follow-up —
-  I can extend the script with a CSS-selector list of "junk" containers
-  to remove before screenshotting.
-- The full Mingtiandi footer is included; if you want it stripped, the
-  same `body_box` selector in the script can be tightened.
+This repo includes `.github/workflows/build.yml`. Push to `main` and
+the Actions tab will produce `mingtiandi_scraper-windows` and
+`mingtiandi_scraper-macos` artifacts. The current run is at:
+`https://github.com/choumakdou/mingtiandi_scraper/actions`
 
 ## Files in this repo
 
 ```
 mingtiandi_scraper/
-├── mingtiandi_scraper.py     # the tool (single-file, ~600 LoC)
-├── requirements.txt          # pip deps
+├── mingtiandi_scraper.py     # the tool (single file, GUI + CLI + core)
+├── requirements.txt          # pip deps (no GUI deps needed — tkinter is stdlib)
 ├── README.md                 # this file
-└── .github/
-    └── workflows/
-        └── build.yml         # GitHub Actions → Windows .exe
+├── articles.xlsx             # 19 articles
+└── .github/workflows/build.yml
 ```
