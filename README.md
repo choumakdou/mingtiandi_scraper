@@ -1,28 +1,42 @@
-# Mingtiandi Bobby Mak Quote PDF Builder (v4.1 — Guided Manual + Header Restoration)
+# Mingtiandi Bobby Mak Quote PDF Builder (v4.2 — Header + Title + Scroll Cue)
 
 A single tool that turns a list of Mingtiandi article URLs into a single
 A4-portrait PDF — one page per article, with the Mingtiandi masthead
 preserved and the paragraph where **Bobby Mak (CHFT Advisory)** is
 quoted highlighted in yellow.
 
-## What's new in v4.1
+## What's new in v4.2
 
-- **Mingtiandi header restored**. When you do `Ctrl+P` → "Save as PDF"
-  in Chrome, the site's `@media print` CSS strips the big MINGTIANDI
-  logo and the "APAC REAL ESTATE INTELLIGENCE" tagline — only the nav
-  menu survives. The tool now re-adds the full masthead (logo +
-  tagline + social icons + subscribe + search + nav menu) at the top
-  of every A4 page. The header PNG is bundled as `default_header.png`
-  next to the script; pick a different PNG in the GUI if you want
-  your own. Toggle on/off with the "Add the Mingtiandi masthead…"
-  checkbox in the Options section.
-- **Programmatic Bobby Mak highlight** for chop mode (was only
-  working in auto-scrape via CSS). The tool now paints a yellow
-  rectangle (with a gold left border, matching the auto-scrape CSS)
-  over the Bobby Mak paragraph in the saved PDF — text shows through
-  via alpha compositing.
-- `partial header` (top 30% of the saved PDF) is auto-cropped before
-  compositing the new header, so the nav menu doesn't appear twice.
+- **Story subject + publish date rendered at the top of every A4 page.**
+  The tool now reads the title (and its continuation line) and the
+  byline from page 1 of the PDF and renders them as bold text above
+  the article body, so you always see "Hong Kong's Chinachem… — 2026/06/10 by Iris Hong" before the quote. Title is word-wrapped automatically.
+- **Visible scroll bar on the right edge** of the article window. A
+  thin gray track with a darker thumb whose position and height
+  reflect where the visible window sits within the full article. So
+  the reader immediately sees "this is a 1-page slice of a longer
+  story".
+- **Pale border + subtle drop shadow** around the article window,
+  reinforcing the "scrolled view" metaphor.
+- **Header layout is now user-editable.** New **Customize…** button
+  in the Inputs section opens a dialog with a live A4 preview,
+  X/Y/W/H spinboxes, a "lock aspect" checkbox, three presets
+  (Full width / Left half / Right half), an Import button, and
+  Apply/Cancel. Layout is saved on the GUI and threaded through to
+  `make_a4_page_from_pdf`, the auto-scrape path, and the CLI
+  (`--header-x / --header-y / --header-w / --header-h`).
+- **Softer highlight on the Bobby Mak paragraph.** Background changed
+  from `#fff59d` @ 86% opacity to `#fffacd` (lemon chiffon) @ 45%
+  opacity, with a thicker 8-px gold left border. The quoted text
+  stays clearly readable.
+- **Fixed `poppler` not found error.** The script used `pdf2image`,
+  which shells out to the `poppler-utils` system package — not
+  installed by default on a fresh Windows box. Swapped to
+  `PyMuPDF` (bundled C library, no system dep). The .exe now works
+  out of the box.
+- `pdf2image` removed from `requirements.txt`; `pymupdf` added.
+
+## What's new in v4.1 (kept)
 
 ## What's new in v4 (kept)
 

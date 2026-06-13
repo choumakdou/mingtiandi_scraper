@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Mingtiandi Bobby Mak Quote PDF Builder (v4.1 — GUI + header restoration)
-====================================================================
+Mingtiandi Bobby Mak Quote PDF Builder (v4.2 — header + title + scroll cue)
+========================================================================
 
 Opens each Mingtiandi article in your real Chrome, exports the page to
 PDF via Chrome's own print engine, then post-processes each PDF to
@@ -59,6 +59,7 @@ import io
 import os
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -76,8 +77,7 @@ def _import_gui():
 
 import openpyxl
 import pdfplumber
-from PIL import Image
-from pdf2image import convert_from_path
+from PIL import Image, ImageFont
 from playwright.async_api import (
     Browser,
     Page,
@@ -336,86 +336,163 @@ def find_bobby_mak_in_pdf(pdf_path: str) -> Optional[tuple[int, float]]:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_HEADER_PNG = os.path.join(SCRIPT_DIR, "default_header.png")
 
+# Default header layout (used by the CLI when --header-layout isn't given)
+DEFAULT_HEADER_LAYOUT = {
+    "x": 0,
+    "y": 0,
+    "w": A4_W_PX,
+    "h": None,           # auto from width + aspect
+    "lock_aspect": True,
+}
+
+
+def pdf_to_images(pdf_path: str, dpi: int = 200) -> list[Image.Image]:
+    """Render every page of a PDF to a PIL Image at the given DPI.
+
+    Uses PyMuPDF (bundled C library — no poppler or other system
+    dependency required, so the .exe works on a fresh Windows box
+    without installing poppler-utils).
+    """
+    import pymupdf
+    out: list[Image.Image] = []
+    with pymupdf.open(pdf_path) as doc:
+        zoom = dpi / 72.0
+        mat = pymupdf.Matrix(zoom, zoom)
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            out.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+    return out
+
+
+def _find_title_and_date(pdf_path: str) -> tuple[Optional[str], Optional[str]]:
+    """Look at the first page of the PDF for the article title (which
+    may span 2 lines) and the publish-date / byline line that follows
+    it. Returns (title, date) strings (either may be None if not found).
+    """
+    NAV_TOKENS = {
+        "SUBSCRIBE", "LOGIN", "CAPITAL MARKETS", "EVENTS", "MTD TV",
+        "PEOPLE", "LOGISTICS", "DATA CENTRES", "ASIA OUTBOUND",
+        "RETAIL", "RESEARCH & POLICY", "ADVERTISE",
+    }
+    try:
+        with pdfplumber.open(pdf_path) as ppdf:
+            if not ppdf.pages:
+                return None, None
+            page = ppdf.pages[0]
+            lines = page.extract_text_lines() or []
+            title = None
+            date = None
+            for i, ln in enumerate(lines):
+                top = float(ln.get("top", 0))
+                text = (ln.get("text") or "").strip()
+                if top < 250:
+                    continue
+                if not text or len(text) < 5:
+                    continue
+                if any(tok in text.upper() for tok in NAV_TOKENS) and len(text) < 60:
+                    continue
+                # Found the first line of the title; collect the next
+                # 1-3 lines too (the title is often 2 lines) until we
+                # hit the date / byline.
+                title_parts = [text]
+                for ln2 in lines[i + 1: i + 5]:
+                    t2 = (ln2.get("text") or "").strip()
+                    if re.search(r"\d{4}/\d{2}/\d{2}|BY\s+\w+", t2, re.IGNORECASE):
+                        date = t2
+                        break
+                    # Heuristic: if this next line is short, uppercase-
+                    # looking (same as title), and not a sentence, treat
+                    # it as a continuation of the title.
+                    if t2 and len(t2) < 70 and (t2.upper() == t2 or t2.istitle()):
+                        title_parts.append(t2)
+                    else:
+                        break
+                title = " ".join(title_parts)
+                break
+            return title, date
+    except Exception:
+        return None, None
+
+
+def _load_font(size: int):
+    """Load a sans-serif TTF font, with fallbacks for Windows / macOS / Linux."""
+    candidates = [
+        "C:\\Windows\\Fonts\\segoeuib.ttf",   # Segoe UI Bold (Win)
+        "C:\\Windows\\Fonts\\arialbd.ttf",    # Arial Bold (Win)
+        "C:\\Windows\\Fonts\\arial.ttf",      # Arial (Win)
+        "C:\\Windows\\Fonts\\segoeui.ttf",    # Segoe UI (Win)
+        "/System/Library/Fonts/Helvetica.ttc",  # macOS
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
 
 def make_a4_page_from_pdf(
     pdf_path: str,
     bobby_mak: Optional[tuple[int, float]],
     header_path: Optional[str] = None,
+    header_layout: Optional[dict] = None,
 ) -> Optional[Image.Image]:
     """Build one A4 page from a PDF.
 
     Steps:
-      1. Convert the Bobby-Mak page of the PDF to a 200-DPI image.
-      2. Skip the partial header at the top of the PDF (the one Chrome's
-         @media print CSS leaves behind — social icons + nav menu but no
-         logo).
-      3. Optionally focus the crop around the Bobby Mak line if the
-         article is longer than one A4 page.
-      4. Paste the supplied header image at the top of a white A4 canvas
-         (so the page looks like the live site), and drop the article
-         content below it.
+      1. Render the Bobby-Mak page of the PDF to a 200-DPI image.
+      2. Find the article title (first text line below the partial
+         header that print-CSS left behind). The crop window ALWAYS
+         starts at the title, so the story subject and publish date
+         are never skipped.
+      3. Focus the crop around the Bobby Mak paragraph if the article
+         is longer than one A4 page, but keep the title visible.
+      4. Paste the header image at the user-configured (x, y, w, h) on
+         a white A4 canvas.
+      5. Draw a pale border + a vertical scroll bar around the article
+         area so it's obvious the page is a "scrolled view".
+      6. Highlight the Bobby Mak paragraph in light lemon chiffon with
+         a thick gold left border, alpha-composited so the text stays
+         readable.
     """
-    pages = [img.convert("RGB") for img in convert_from_path(pdf_path, dpi=200)]
+    from PIL import ImageDraw
+
+    if header_layout is None:
+        header_layout = {"x": 0, "y": 0, "w": A4_W_PX, "h": None, "lock_aspect": True}
+
+    pages = pdf_to_images(pdf_path, dpi=200)
     if not pages:
         return None
     target_idx = min(bobby_mak[0], len(pages) - 1) if bobby_mak else 0
     primary = pages[target_idx]
     pw, ph = primary.size
     a4_w, a4_h = A4_W_PX, A4_H_PX
-
-    # Heuristic: the print-CSS-bleed header (social icons + nav menu but
-    # no logo) takes roughly the top 30% of an A4 page at 200 DPI.
-    partial_header_h = int(ph * 0.30)
-    content_y0 = partial_header_h
-    content_h_total = ph - content_y0
-
-    # Apply Bobby-Mak focus within the content area if it's taller than
-    # what fits below the header.
     DPI = 200
-    header_h_on_a4 = 0
-    if header_path and os.path.exists(header_path):
-        try:
-            with Image.open(header_path) as h:
-                header_h_on_a4 = int(h.height * (a4_w / h.width))
-        except Exception:
-            header_h_on_a4 = 0
-    article_budget = a4_h - header_h_on_a4
 
-    crop_offset_y = 0  # y in the *original* page where article_img starts
-    if bobby_mak and content_h_total > article_budget:
-        _, bobby_y_pt = bobby_mak
-        bobby_y_px = int(bobby_y_pt / 72.0 * DPI) - content_y0
-        crop_top = max(0, bobby_y_px - content_h_total // 3)
-        crop_bottom = min(content_h_total, crop_top + article_budget)
-        if crop_bottom - crop_top < article_budget and content_h_total >= article_budget:
-            crop_bottom = content_h_total
-            crop_top = max(0, crop_bottom - article_budget)
-        article_img = primary.crop(
-            (0, content_y0 + crop_top, pw, content_y0 + crop_bottom)
-        )
-        crop_offset_y = content_y0 + crop_top
-    elif content_h_total <= article_budget:
-        article_img = primary.crop((0, content_y0, pw, ph))
-        crop_offset_y = content_y0
-    else:
-        # Long article, no Bobby Mak found — just take the top of the content
-        article_img = primary.crop((0, content_y0, pw, content_y0 + article_budget))
-        crop_offset_y = content_y0
+    # ---- 1. Find the title and date by scanning the first page ----
+    # (The title is on page 1 of the article, but Bobby Mak may be on a
+    # later page. We extract the title and date as text and render them
+    # ourselves so they're always at the top of the A4 page.)
+    title_text, date_text = _find_title_and_date(pdf_path)
+    if not title_text:
+        title_text = "Article"
+    if not date_text:
+        date_text = ""
 
-    # Yellow highlight on the Bobby Mak paragraph (chop-mode only — the
-    # auto-scrape mode injects CSS for this). Find the paragraph's start
-    # in the cropped image and paint a yellow rectangle with a gold left
-    # border, matching the auto-scrape CSS.
+    # ---- 2. Find the paragraph end (for highlight height) ----
+    para_height_px = 200
+    para_end_pt = None
     if bobby_mak:
-        from PIL import ImageDraw
         _, bobby_y_pt = bobby_mak
-        bobby_y_px_in_cropped = int(bobby_y_pt / 72.0 * DPI) - crop_offset_y
-        para_height_px = 200  # default fallback
         try:
             with pdfplumber.open(pdf_path) as ppdf:
-                ppage = ppdf.pages[min(bobby_mak[0], len(ppdf.pages) - 1)]
+                ppage = ppdf.pages[target_idx]
                 lines = ppage.extract_text_lines() or []
-                # Find Bobby Mak line
                 bobby_line = None
                 for ln in lines:
                     if "Bobby Mak" in (ln.get("text") or "") and len(ln.get("text") or "") < 1200:
@@ -423,10 +500,7 @@ def make_a4_page_from_pdf(
                         break
                 if bobby_line is not None:
                     bobby_top = float(bobby_line.get("top", 0))
-                    # All lines after Bobby Mak
                     post_lines = [ln for ln in lines if float(ln.get("top", 0)) >= bobby_top]
-                    # Typical line height = the gap between the first two
-                    # post-Bobby lines (assumes body text is uniform)
                     if len(post_lines) >= 2:
                         typical_gap = (
                             float(post_lines[1].get("top", 0))
@@ -434,64 +508,185 @@ def make_a4_page_from_pdf(
                         )
                     else:
                         typical_gap = 18
-                    # Find the first gap > 1.6x typical_gap = paragraph end
                     para_end_pt = bobby_top + 4 * typical_gap
                     for i in range(1, len(post_lines)):
                         prev = post_lines[i - 1]
                         cur = post_lines[i]
-                        prev_top = float(prev.get("top", 0))
-                        cur_top = float(cur.get("top", 0))
-                        if cur_top - prev_top > typical_gap * 1.6:
-                            para_end_pt = prev_top + typical_gap
+                        if float(cur.get("top", 0)) - float(prev.get("top", 0)) > typical_gap * 1.6:
+                            para_end_pt = float(prev.get("top", 0)) + typical_gap
                             break
                     else:
-                        # Never broke — paragraph goes to the end of the page
                         if post_lines:
                             last = post_lines[-1]
                             para_end_pt = float(last.get("bottom", last.get("top", 0) + typical_gap))
                     para_height_px = int((para_end_pt - bobby_top) / 72.0 * DPI) + 4
         except Exception:
             pass
-        highlight_y0 = max(0, bobby_y_px_in_cropped - 6)
+
+    # ---- 3. Decide the crop window ----
+    # The article body lives on the Bobby-Mak page. We crop a window
+    # focused on Bobby Mak (1/3 above, 2/3 below) so the paragraph is
+    # prominent. We also remember the FULL page height as `full_h_px`
+    # so the scroll-bar thumb reflects where the visible window sits
+    # within the full page.
+    full_h_px = ph
+    bobby_y_px_full = int((bobby_mak[1] if bobby_mak else 100) / 72.0 * DPI)
+    # Window budget: use a sensible default; the article area on the
+    # A4 is computed below, and we may need to clamp to it.
+    desired_window_h = int(1200)  # pixels of the source page to show
+    src_crop_top = max(0, bobby_y_px_full - desired_window_h // 3)
+    src_crop_bottom = min(ph, src_crop_top + desired_window_h)
+    src_crop_offset_y = src_crop_top
+    article_img = primary.crop((0, src_crop_top, pw, src_crop_bottom))
+
+    # ---- 4. Soft yellow highlight on the Bobby Mak paragraph ----
+    if bobby_mak:
+        _, bobby_y_pt = bobby_mak
+        bobby_y_px_in_cropped = int(bobby_y_pt / 72.0 * DPI) - src_crop_offset_y
+        highlight_y0 = max(0, bobby_y_px_in_cropped - 4)
         highlight_y1 = min(article_img.height, bobby_y_px_in_cropped + para_height_px)
         if highlight_y1 > highlight_y0:
-            # Alpha-composite the highlight so the text shows through
             article_rgba = article_img.convert("RGBA")
             overlay = Image.new("RGBA", article_img.size, (0, 0, 0, 0))
             odraw = ImageDraw.Draw(overlay)
+            # Light lemon chiffon at 45% opacity — text stays readable
             odraw.rectangle(
                 [(0, highlight_y0), (article_img.width, highlight_y1)],
-                fill=(255, 245, 157, 220),  # #fff59d, ~86% opacity
+                fill=(255, 250, 205, 115),  # #fffacd, ~45% opacity
             )
+            # Thicker gold left border (8px instead of 4)
             odraw.rectangle(
-                [(0, highlight_y0), (4, highlight_y1)],
+                [(0, highlight_y0), (8, highlight_y1)],
                 fill=(246, 192, 38, 255),  # #f6c026, full opacity
             )
             article_rgba = Image.alpha_composite(article_rgba, overlay)
             article_img = article_rgba.convert("RGB")
 
-    # Build the A4 canvas
+    # ---- 5. Build the A4 canvas with header + title + article + scroll cue ----
     canvas = Image.new("RGB", (a4_w, a4_h), "white")
-    if header_h_on_a4 > 0 and header_path and os.path.exists(header_path):
+
+    # Resolve header geometry
+    hdr_y = int(header_layout.get("y", 0))
+    hdr_w = int(header_layout.get("w", a4_w))
+    hdr_h_cfg = header_layout.get("h")
+    if header_path and os.path.exists(header_path):
+        try:
+            with Image.open(header_path) as _h_img:
+                src_w, src_h = _h_img.size
+        except Exception:
+            src_w, src_h = hdr_w, 200
+    else:
+        src_w, src_h = hdr_w, 200
+    if hdr_h_cfg is None:
+        hdr_h = int(hdr_w * src_h / max(1, src_w))
+    else:
+        hdr_h = int(hdr_h_cfg)
+
+    # Paste header at the user-configured (x, y, w, h)
+    if header_path and os.path.exists(header_path):
         try:
             header = Image.open(header_path).convert("RGB")
-            header = header.resize((a4_w, header_h_on_a4), Image.LANCZOS)
-            canvas.paste(header, (0, 0))
+            header = header.resize((hdr_w, hdr_h), Image.LANCZOS)
+            paste_x = int(header_layout.get("x", 0))
+            paste_y = int(header_layout.get("y", 0))
+            canvas.paste(header, (paste_x, paste_y))
         except Exception as e:
             print(f"    [!] Header paste failed: {e}", flush=True)
-            header_h_on_a4 = 0
+            hdr_h = 0
 
-    # Fit the article content into the space below the header
-    content_h = a4_h - header_h_on_a4
+    # ---- 5b. Render the article title + publish date as text ----
+    # Placed in a band between the header and the article body so the
+    # story subject is always visible at the top of the A4 page.
+    draw = ImageDraw.Draw(canvas)
+    title_font = _load_font(38)
+    date_font = _load_font(18)
+    text_left = 40
+    text_right = a4_w - 60  # leave room for the scroll bar
+    title_y_text = hdr_y + hdr_h + 20
+    # Word-wrap the title into multiple lines that fit `text_right - text_left`
+    def wrap(text, font, max_w):
+        words = text.split()
+        lines, cur = [], ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            bbox = draw.textbbox((0, 0), test, font=font)
+            if bbox[2] - bbox[0] <= max_w or not cur:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
+    title_lines = wrap(title_text.upper(), title_font, text_right - text_left)
+    line_h = 46
+    title_block_h = line_h * len(title_lines) + 8
+    for i, line in enumerate(title_lines):
+        draw.text((text_left, title_y_text + i * line_h), line,
+                  font=title_font, fill=(50, 50, 55))
+    if date_text:
+        date_y_text = title_y_text + title_block_h + 4
+        draw.text((text_left, date_y_text), date_text,
+                  font=date_font, fill=(120, 120, 125))
+        article_top = date_y_text + 32
+    else:
+        article_top = title_y_text + title_block_h + 16
+    article_area_h = max(150, a4_h - article_top - 30)
+
+    # Fit the article into the article area
     a_w, a_h = article_img.size
     if a_h > 0 and a_w > 0:
-        scale = min(a4_w / a_w, content_h / a_h)
+        scale = min(a4_w / a_w, article_area_h / a_h)
         new_w = max(1, int(a_w * scale))
         new_h = max(1, int(a_h * scale))
         resized = article_img.resize((new_w, new_h), Image.LANCZOS)
         x = (a4_w - new_w) // 2
-        y = header_h_on_a4 + max(0, (content_h - new_h) // 2)
+        y = article_top + max(0, (article_area_h - new_h) // 2)
+        border_pad = 4
+        border_rect = [
+            (x - border_pad, y - border_pad),
+            (x + new_w + border_pad - 1, y + new_h + border_pad - 1),
+        ]
+
+        # ---- 6. Pale border + drop shadow (scroll cue) ----
+        draw = ImageDraw.Draw(canvas)
+        # Subtle drop shadow — a soft 2-px gray frame offset down+right.
+        # Drawn BEFORE the article so it sits behind it.
+        for dx, dy in [(2, 2), (3, 3), (4, 4)]:
+            shadow_rect = [
+                (border_rect[0][0] + dx, border_rect[0][1] + dy),
+                (border_rect[1][0] + dx, border_rect[1][1] + dy),
+            ]
+            draw.rectangle(shadow_rect, outline=(215, 215, 215), width=1)
+
+        # Paste the article (covers the shadow on its own footprint)
         canvas.paste(resized, (x, y))
+
+        # Pale border around the article (drawn on top of the article edge)
+        draw.rectangle(border_rect, outline=(180, 180, 180), width=1)
+
+        # ---- 7. Vertical scroll bar on the right edge ----
+        scroll_x = a4_w - 18
+        scroll_w = 6
+        scroll_top = y - border_pad
+        scroll_bottom = y + new_h + border_pad
+        scroll_h = scroll_bottom - scroll_top
+        # Track
+        draw.rectangle(
+            [(scroll_x, scroll_top), (scroll_x + scroll_w, scroll_bottom)],
+            fill=(235, 235, 235),
+        )
+        # Thumb — proportion of visible content vs. the full page
+        visible_h_px = src_crop_bottom - src_crop_top
+        if full_h_px > 0:
+            thumb_h = max(20, int(visible_h_px / full_h_px * scroll_h))
+            visible_start_in_full = src_crop_top
+            thumb_y = scroll_top + int(visible_start_in_full / full_h_px * scroll_h)
+            thumb_y = max(scroll_top, min(scroll_bottom - thumb_h, thumb_y))
+            draw.rectangle(
+                [(scroll_x, thumb_y), (scroll_x + scroll_w, thumb_y + thumb_h)],
+                fill=(150, 150, 150),
+            )
     return canvas
 
 
@@ -518,6 +713,7 @@ async def run_scrape_core(
     progress_cb=None,
     cancel_evt: Optional[threading.Event] = None,
     header_path: Optional[str] = None,
+    header_layout: Optional[dict] = None,
 ) -> Optional[str]:
     """End-to-end scrape -> process -> combine. log_cb(str), progress_cb(float 0..1)."""
     def log(msg: str):
@@ -555,7 +751,7 @@ async def run_scrape_core(
                     log("    [!] Could not locate 'Bobby Mak' in raw PDF text.")
                 else:
                     log(f"    Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
-                a4 = make_a4_page_from_pdf(raw_pdf, bobby, header_path=header_path)
+                a4 = make_a4_page_from_pdf(raw_pdf, bobby, header_path=header_path, header_layout=header_layout)
                 if a4 is not None:
                     a4_pages.append(a4)
                     png_out = os.path.join(work_dir, f"article_{i:02d}.png")
@@ -901,6 +1097,270 @@ class GuidedManualDialog:
         return self.result
 
 
+class HeaderLayoutDialog:
+    """Live-preview dialog that lets the user pick a header PNG, set its
+    position (X, Y) and size (W, H) on the A4 canvas, and toggle
+    "lock aspect ratio" so width and height stay in sync.
+
+    The A4 canvas is 1240x1754 px. The preview is a 248x351 thumbnail
+    (1/5 scale) with a 1-px orange rectangle showing where the header
+    will land. All controls update the preview in real time.
+
+    On Apply, calls on_apply(layout, path) and closes.
+    On Cancel, discards changes and closes.
+    """
+
+    A4_W = 1240
+    A4_H = 1754
+    PREVIEW_SCALE = 5  # 1240 / 5 = 248 px wide preview
+
+    def __init__(self, parent, header_path: str, layout: dict, on_apply):
+        self.parent = parent
+        self.header_path = header_path
+        self.layout = dict(layout)
+        self.on_apply = on_apply
+        # Load the source image to read its aspect ratio
+        self.src_w, self.src_h = 1141, 200  # default header size
+        if header_path and os.path.exists(header_path):
+            try:
+                with Image.open(header_path) as im:
+                    self.src_w, self.src_h = im.size
+            except Exception:
+                pass
+        # Resolve auto height from width + aspect
+        if self.layout.get("h") is None and self.src_w and self.src_h:
+            self.layout["h"] = int(self.layout["w"] * self.src_h / self.src_w)
+
+        self.win = parent._tk.Toplevel(parent.root)
+        self.win.title("Customize Header Layout")
+        self.win.geometry("720x540")
+        self.win.minsize(640, 480)
+        self.win.transient(parent.root)
+        self.win.grab_set()
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+        self.win.after(500, lambda: self.win.attributes("-topmost", False))
+
+        self._build()
+        self._update_preview()
+
+    def _build(self):
+        tk = self.parent._tk
+        ttk = self.parent._ttk
+        pad = {"padx": 8, "pady": 4}
+
+        # Top: file path + import
+        top = ttk.Frame(self.win, padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="Header image:").grid(row=0, column=0, sticky="w", **pad)
+        self.path_var = tk.StringVar(value=self.header_path)
+        ttk.Entry(top, textvariable=self.path_var).grid(
+            row=0, column=1, sticky="ew", **pad
+        )
+        ttk.Button(top, text="Import…", command=self._on_import).grid(
+            row=0, column=2, **pad
+        )
+        ttk.Button(top, text="Reset", command=self._on_reset).grid(
+            row=0, column=3, **pad
+        )
+        top.columnconfigure(1, weight=1)
+
+        # Two columns: preview (left) and controls (right)
+        body = ttk.Frame(self.win, padding=10)
+        body.pack(fill="both", expand=True)
+
+        # Left: A4 preview canvas
+        left = ttk.LabelFrame(body, text="A4 preview (preview is 1/5 scale)", padding=8)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        prev_w = self.A4_W // self.PREVIEW_SCALE
+        prev_h = self.A4_H // self.PREVIEW_SCALE
+        self.canvas = tk.Canvas(
+            left, width=prev_w, height=prev_h,
+            background="#f7f7f7", highlightthickness=1, highlightbackground="#ccc",
+        )
+        self.canvas.pack(pady=4)
+        self.canvas_text = ttk.Label(left, text="", font=("Consolas", 9))
+        self.canvas_text.pack(pady=4)
+
+        # Right: controls
+        right = ttk.LabelFrame(body, text="Position & size (pixels on the A4 canvas)", padding=8)
+        right.pack(side="left", fill="y", padx=(8, 0))
+
+        self.x_var = tk.IntVar(value=int(self.layout.get("x", 0)))
+        self.y_var = tk.IntVar(value=int(self.layout.get("y", 0)))
+        self.w_var = tk.IntVar(value=int(self.layout.get("w", self.A4_W)))
+        self.h_var = tk.IntVar(value=int(self.layout.get("h", 200)))
+        self.lock_var = tk.BooleanVar(value=bool(self.layout.get("lock_aspect", True)))
+
+        def add_spinbox(parent, label, var, frm, row, mn, mx, cmd=None):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=2)
+            sb = ttk.Spinbox(
+                parent, from_=mn, to=mx, textvariable=var, width=8, increment=1,
+                command=cmd or (lambda: self._on_value_change()),
+            )
+            sb.grid(row=row, column=1, sticky="ew", padx=4, pady=2)
+            sb.bind("<KeyRelease>", lambda e: self._on_value_change())
+            return sb
+
+        add_spinbox(right, "X (from left):",   self.x_var, right, 0, -500, self.A4_W)
+        add_spinbox(right, "Y (from top):",    self.y_var, right, 1, -500, self.A4_H)
+        add_spinbox(right, "Width:",            self.w_var, right, 2, 50,   self.A4_W)
+        add_spinbox(right, "Height:",           self.h_var, right, 3, 20,   self.A4_H + 500)
+
+        ttk.Checkbutton(
+            right, text="Lock aspect ratio (changes to W auto-update H)",
+            variable=self.lock_var, command=self._on_lock_toggle,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+
+        ttk.Separator(right, orient="horizontal").grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=6
+        )
+
+        # Preset buttons
+        ttk.Label(right, text="Presets:").grid(row=6, column=0, sticky="w", padx=4, pady=2)
+        preset_frame = ttk.Frame(right)
+        preset_frame.grid(row=6, column=1, sticky="w", padx=4, pady=2)
+        ttk.Button(preset_frame, text="Full width", command=self._preset_full,
+                   width=10).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Left half",  command=self._preset_left,
+                   width=10).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Right half", command=self._preset_right,
+                   width=10).pack(side="left", padx=2)
+
+        right.columnconfigure(1, weight=1)
+
+        # Bottom: result summary + apply/cancel
+        bottom = ttk.Frame(self.win, padding=10)
+        bottom.pack(fill="x")
+        self.summary_var = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=self.summary_var, font=("Consolas", 9),
+                  foreground="#444").pack(side="left", padx=4)
+        ttk.Button(bottom, text="Cancel", command=self._on_cancel, width=12).pack(
+            side="right", padx=4
+        )
+        ttk.Button(bottom, text="Apply", command=self._on_apply, width=12).pack(
+            side="right", padx=4
+        )
+
+        # Initial summary
+        self._refresh_summary()
+
+    # ---------------------- handlers ----------------------
+    def _on_import(self):
+        path = self.parent._filedialog.askopenfilename(
+            title="Pick a header image",
+            filetypes=[("PNG / JPG / GIF", "*.png *.jpg *.jpeg *.gif *.bmp"),
+                       ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.header_path = path
+        self.path_var.set(path)
+        # Refresh aspect ratio
+        try:
+            with Image.open(path) as im:
+                self.src_w, self.src_h = im.size
+        except Exception:
+            pass
+        # If lock aspect, re-derive height from current width
+        if self.lock_var.get() and self.src_w and self.src_h:
+            self.h_var.set(int(self.w_var.get() * self.src_h / self.src_w))
+        self._on_value_change()
+
+    def _on_reset(self):
+        self.x_var.set(0)
+        self.y_var.set(0)
+        self.w_var.set(self.A4_W)
+        if self.src_w and self.src_h:
+            self.h_var.set(int(self.A4_W * self.src_h / self.src_w))
+        else:
+            self.h_var.set(200)
+        self.lock_var.set(True)
+        self.header_path = DEFAULT_HEADER_PNG
+        self.path_var.set(DEFAULT_HEADER_PNG)
+        try:
+            with Image.open(DEFAULT_HEADER_PNG) as im:
+                self.src_w, self.src_h = im.size
+        except Exception:
+            pass
+        self._on_value_change()
+
+    def _on_lock_toggle(self):
+        if self.lock_var.get() and self.src_w and self.src_h:
+            self.h_var.set(int(self.w_var.get() * self.src_h / self.src_w))
+        self._on_value_change()
+
+    def _on_value_change(self):
+        if self.lock_var.get() and self.src_w and self.src_h:
+            self.h_var.set(int(self.w_var.get() * self.src_h / self.src_w))
+        self._update_preview()
+        self._refresh_summary()
+
+    def _preset_full(self):
+        self.x_var.set(0)
+        self.w_var.set(self.A4_W)
+        self._on_value_change()
+
+    def _preset_left(self):
+        self.w_var.set(self.A4_W // 2)
+        if self.lock_var.get() and self.src_w and self.src_h:
+            self.h_var.set(int(self.w_var.get() * self.src_h / self.src_w))
+        self._on_value_change()
+
+    def _preset_right(self):
+        self.w_var.set(self.A4_W // 2)
+        self.x_var.set(self.A4_W - self.w_var.get())
+        if self.lock_var.get() and self.src_w and self.src_h:
+            self.h_var.set(int(self.w_var.get() * self.src_h / self.src_w))
+        self._on_value_change()
+
+    def _update_preview(self):
+        s = self.PREVIEW_SCALE
+        c = self.canvas
+        c.delete("all")
+        prev_w = self.A4_W // s
+        prev_h = self.A4_H // s
+        # A4 page outline
+        c.create_rectangle(0, 0, prev_w, prev_h, outline="#888", fill="white", width=1)
+        # Header rectangle
+        hx = int(self.x_var.get() / s)
+        hy = int(self.y_var.get() / s)
+        hw = max(1, int(self.w_var.get() / s))
+        hh = max(1, int(self.h_var.get() / s))
+        c.create_rectangle(
+            hx, hy, hx + hw, hy + hh,
+            outline="#f6c026", fill="#fff8e1", width=1,
+        )
+        # If the header is positioned roughly at the top, also draw a
+        # thin guide line at y=0 to show "page top"
+        c.create_line(0, 0, prev_w, 0, fill="#bbb", dash=(2, 2))
+
+    def _refresh_summary(self):
+        x, y = self.x_var.get(), self.y_var.get()
+        w, h = self.w_var.get(), self.h_var.get()
+        self.summary_var.set(
+            f"Header: {w} x {h} px at (x={x}, y={y}) on a 1240 x 1754 A4 canvas"
+        )
+
+    def _on_apply(self):
+        layout = {
+            "x": int(self.x_var.get()),
+            "y": int(self.y_var.get()),
+            "w": int(self.w_var.get()),
+            "h": int(self.h_var.get()),
+            "lock_aspect": bool(self.lock_var.get()),
+        }
+        try:
+            self.on_apply(layout, self.header_path)
+        except Exception as e:
+            self.parent._messagebox.showerror("Apply failed", str(e))
+            return
+        self.win.destroy()
+
+    def _on_cancel(self):
+        self.win.destroy()
+
+
 class ScraperGUI:
     """Tkinter GUI. Routes print/log output through self._log."""
 
@@ -942,6 +1402,15 @@ class ScraperGUI:
         # v4.1: header image (defaults to the bundled default_header.png)
         self.header_var = tk.StringVar(value=DEFAULT_HEADER_PNG)
         self.use_header_var = tk.BooleanVar(value=True)
+        # v4.2: header layout (x, y, w, h in pixels on the 1240x1754 A4 canvas)
+        # None for w/h means "auto" (full width or aspect-locked)
+        self.header_layout = {
+            "x": 0,
+            "y": 0,
+            "w": 1240,
+            "h": None,           # auto from width + aspect
+            "lock_aspect": True,
+        }
         # v4: where the GuidedManualDialog writes user-saved PDFs
         self.guided_pdfs_dir: Optional[str] = None
 
@@ -978,7 +1447,7 @@ class ScraperGUI:
         ).pack(side="left")
         ttk.Label(
             title,
-            text="v4.1 — pick a mode, then Start",
+            text="v4.2 — pick a mode, then Start",
             foreground="#666",
         ).pack(side="left", padx=12)
 
@@ -1048,6 +1517,11 @@ class ScraperGUI:
             frm, text="Browse…", command=self._browse_header
         )
         self.header_btn.grid(row=4, column=2, **pad)
+        # v4.2: header layout dialog
+        self.header_customize_btn = ttk.Button(
+            frm, text="Customize…", command=self._open_header_layout
+        )
+        self.header_customize_btn.grid(row=4, column=3, **pad)
 
         # Options section
         opt = ttk.LabelFrame(root, text="3.  Options", padding=10)
@@ -1156,6 +1630,26 @@ class ScraperGUI:
         if path:
             self.header_var.set(path)
             self._log(f"Header image: {path}")
+
+    def _open_header_layout(self):
+        try:
+            HeaderLayoutDialog(
+                parent=self,
+                header_path=self.header_var.get(),
+                layout=dict(self.header_layout),
+                on_apply=self._apply_header_layout,
+            )
+        except Exception as e:
+            self._messagebox.showerror("Header layout", f"Could not open: {e}")
+
+    def _apply_header_layout(self, new_layout: dict, new_path: str):
+        self.header_layout = dict(new_layout)
+        self.header_var.set(new_path)
+        self._log(
+            f"Header layout updated: x={new_layout['x']} y={new_layout['y']} "
+            f"w={new_layout['w']} h={new_layout['h']} "
+            f"lock_aspect={new_layout['lock_aspect']}"
+        )
 
     def _resolve_header_path(self) -> Optional[str]:
         if not self.use_header_var.get():
@@ -1325,6 +1819,7 @@ class ScraperGUI:
                         progress_cb=gui_prog,
                         cancel_evt=self.cancel_evt,
                         header_path=self._resolve_header_path(),
+                        header_layout=dict(self.header_layout),
                     )
                 )
                 if result:
@@ -1390,6 +1885,7 @@ class ScraperGUI:
                         log_cb=self._log,
                         progress_cb=self._set_status,
                         header_path=self._resolve_header_path(),
+                        header_layout=dict(self.header_layout),
                     )
                     if out:
                         self._set_status("Done ✓", 1.0)
@@ -1436,6 +1932,7 @@ class ScraperGUI:
                     log_cb=self._log,
                     progress_cb=self._set_status,
                     header_path=self._resolve_header_path(),
+                    header_layout=dict(self.header_layout),
                 )
                 if out:
                     self._set_status("Done ✓", 1.0)
@@ -1477,6 +1974,7 @@ class ScraperGUI:
                     log_cb=self._log,
                     progress_cb=self._set_status,
                     header_path=self._resolve_header_path(),
+                    header_layout=dict(self.header_layout),
                 )
                 if out:
                     self._set_status("Done ✓", 1.0)
@@ -1500,6 +1998,7 @@ class ScraperGUI:
         log_cb=None,
         progress_cb=None,
         header_path: Optional[str] = None,
+        header_layout: Optional[dict] = None,
     ) -> Optional[str]:
         def log(msg: str):
             if log_cb:
@@ -1531,7 +2030,7 @@ class ScraperGUI:
                 log("      [!] No 'Bobby Mak' line found in text — page will still be cropped to A4")
             else:
                 log(f"      Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
-            a4 = make_a4_page_from_pdf(pdf_path, bobby, header_path=header_path)
+            a4 = make_a4_page_from_pdf(pdf_path, bobby, header_path=header_path, header_layout=header_layout)
             if a4 is not None:
                 a4_pages.append(a4)
             if progress_cb:
@@ -1584,6 +2083,7 @@ class ScraperGUI:
 def run_pdf_chop_mode(
     pdf_input_dir: str, output_pdf: str, articles: list[dict],
     header_path: Optional[str] = None,
+    header_layout: Optional[dict] = None,
 ) -> None:
     pdf_files = sorted(
         os.path.join(pdf_input_dir, f)
@@ -1614,7 +2114,7 @@ def run_pdf_chop_mode(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.1 — GUI + header restoration)",
+        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.2 — header + title + scroll cue)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1639,6 +2139,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--no-header",
         action="store_true",
         help="Skip the header banner (use the raw page only)",
+    )
+    ap.add_argument(
+        "--header-x", type=int, default=0,
+        help="Header X offset in px (default: 0)"
+    )
+    ap.add_argument(
+        "--header-y", type=int, default=0,
+        help="Header Y offset in px (default: 0)"
+    )
+    ap.add_argument(
+        "--header-w", type=int, default=A4_W_PX,
+        help="Header width in px (default: 1240, full A4 width)"
+    )
+    ap.add_argument(
+        "--header-h", type=int, default=0,
+        help="Header height in px (default: 0 = auto from width + aspect)"
     )
     ap.add_argument(
         "--gui",
@@ -1667,12 +2183,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         return
 
     header_path: Optional[str] = None
+    header_layout = dict(DEFAULT_HEADER_LAYOUT)
     if not args.no_header:
         if args.header and os.path.exists(args.header):
             header_path = args.header
             print(f"[*] Header image: {header_path}")
         elif args.header and args.header != DEFAULT_HEADER_PNG:
             print(f"[!] Header file not found: {args.header}")
+        header_layout["x"] = args.header_x
+        header_layout["y"] = args.header_y
+        header_layout["w"] = args.header_w
+        header_layout["h"] = args.header_h if args.header_h > 0 else None
+        print(f"[*] Header layout: x={header_layout['x']} y={header_layout['y']} "
+              f"w={header_layout['w']} h={header_layout['h']}")
 
     articles: list[dict] = []
     if args.input and os.path.exists(args.input):
@@ -1692,13 +2215,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 headless=not args.no_headless,
                 user_agent=args.user_agent,
                 header_path=header_path,
+                header_layout=header_layout,
             )
         )
     else:
         if not args.pdf_input or not os.path.isdir(args.pdf_input):
             print("[!] --pdf-input is required for pdf-chop mode.", file=sys.stderr)
             sys.exit(2)
-        run_pdf_chop_mode(args.pdf_input, args.output, articles, header_path=header_path)
+        run_pdf_chop_mode(args.pdf_input, args.output, articles, header_path=header_path, header_layout=header_layout)
 
 
 if __name__ == "__main__":
