@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Mingtiandi Bobby Mak Quote PDF Builder (v4.2 — header + title + scroll cue)
-========================================================================
+Mingtiandi Bobby Mak Quote PDF Builder (v4.3 — user-adjustable A4 sections)
+============================================================================
 
 Opens each Mingtiandi article in your real Chrome, exports the page to
 PDF via Chrome's own print engine, then post-processes each PDF to
@@ -441,6 +441,7 @@ def make_a4_page_from_pdf(
     bobby_mak: Optional[tuple[int, float]],
     header_path: Optional[str] = None,
     header_layout: Optional[dict] = None,
+    section_heights: Optional[dict] = None,
 ) -> Optional[Image.Image]:
     """Build one A4 page from a PDF.
 
@@ -459,11 +460,18 @@ def make_a4_page_from_pdf(
       6. Highlight the Bobby Mak paragraph in light lemon chiffon with
          a thick gold left border, alpha-composited so the text stays
          readable.
+
+    `section_heights` (optional) is a dict with keys "header", "title",
+    "article" giving the pixel heights of the three A4 sections.
+    Defaults: {header: 220, title: 130, article: 1404}. The article
+    section is filled (not centered) so the whole A4 is used up.
     """
     from PIL import ImageDraw
 
     if header_layout is None:
         header_layout = {"x": 0, "y": 0, "w": A4_W_PX, "h": None, "lock_aspect": True}
+    if section_heights is None:
+        section_heights = {"header": 220, "title": 130, "article": 1404}
 
     pages = pdf_to_images(pdf_path, dpi=200)
     if not pages:
@@ -529,11 +537,20 @@ def make_a4_page_from_pdf(
     # prominent. We also remember the FULL page height as `full_h_px`
     # so the scroll-bar thumb reflects where the visible window sits
     # within the full page.
+    #
+    # NOTE on Y coords: pdfplumber's "top" attribute is the distance
+    # from the TOP of the page (top-origin), so converting to image
+    # pixels is simply top_pt / 72 * DPI. Verified empirically with
+    # an overlay against the rendered image.
     full_h_px = ph
-    bobby_y_px_full = int((bobby_mak[1] if bobby_mak else 100) / 72.0 * DPI)
-    # Window budget: use a sensible default; the article area on the
-    # A4 is computed below, and we may need to clamp to it.
-    desired_window_h = int(1200)  # pixels of the source page to show
+    bobby_y_px_full = int((bobby_mak[1] if bobby_mak else 0) / 72.0 * DPI)
+    # Window budget: match the article section's pixel height on the
+    # A4 canvas, scaled back to source-page pixels. This way the
+    # article fills the section instead of being centered in a larger
+    # area (which is what was wasting ~30% of the A4 before).
+    art_section_h_px = int(section_heights.get("article", 1404))
+    scale_to_width = a4_w / pw
+    desired_window_h = int(art_section_h_px / scale_to_width)
     src_crop_top = max(0, bobby_y_px_full - desired_window_h // 3)
     src_crop_bottom = min(ph, src_crop_top + desired_window_h)
     src_crop_offset_y = src_crop_top
@@ -541,10 +558,14 @@ def make_a4_page_from_pdf(
 
     # ---- 4. Soft yellow highlight on the Bobby Mak paragraph ----
     if bobby_mak:
-        _, bobby_y_pt = bobby_mak
-        bobby_y_px_in_cropped = int(bobby_y_pt / 72.0 * DPI) - src_crop_offset_y
+        bobby_y_px_in_cropped = bobby_y_px_full - src_crop_offset_y
+        if para_end_pt is not None:
+            para_end_px_full = int(para_end_pt / 72.0 * DPI)
+            para_h_in_cropped = para_end_px_full - src_crop_offset_y - bobby_y_px_in_cropped
+        else:
+            para_h_in_cropped = para_height_px
         highlight_y0 = max(0, bobby_y_px_in_cropped - 4)
-        highlight_y1 = min(article_img.height, bobby_y_px_in_cropped + para_height_px)
+        highlight_y1 = min(article_img.height, bobby_y_px_in_cropped + para_h_in_cropped)
         if highlight_y1 > highlight_y0:
             article_rgba = article_img.convert("RGBA")
             overlay = Image.new("RGBA", article_img.size, (0, 0, 0, 0))
@@ -597,12 +618,26 @@ def make_a4_page_from_pdf(
     # ---- 5b. Render the article title + publish date as text ----
     # Placed in a band between the header and the article body so the
     # story subject is always visible at the top of the A4 page.
+    # Use the user-specified section heights so the layout uses the
+    # whole A4 page.
     draw = ImageDraw.Draw(canvas)
     title_font = _load_font(38)
     date_font = _load_font(18)
     text_left = 40
     text_right = a4_w - 60  # leave room for the scroll bar
-    title_y_text = hdr_y + hdr_h + 20
+
+    # Layout: header from 0 to header_section_h, title section from
+    # header_section_h to header_section_h + title_section_h, article
+    # section fills the rest.
+    title_section_top = int(section_heights.get("header", 220))
+    title_section_h = int(section_heights.get("title", 130))
+    article_section_top = title_section_top + title_section_h
+    article_area_h = int(section_heights.get("article", 1404))
+
+    # Pad inside the title section
+    title_pad = 12
+    title_y_text = title_section_top + title_pad
+
     # Word-wrap the title into multiple lines that fit `text_right - text_left`
     def wrap(text, font, max_w):
         words = text.split()
@@ -620,28 +655,39 @@ def make_a4_page_from_pdf(
         return lines
     title_lines = wrap(title_text.upper(), title_font, text_right - text_left)
     line_h = 46
-    title_block_h = line_h * len(title_lines) + 8
+    # If there are too many title lines to fit the section, shrink the
+    # line height so we still fit.
+    max_title_lines = max(1, (title_section_h - title_pad * 2 - 24) // line_h)
+    if len(title_lines) > max_title_lines:
+        line_h = max(28, (title_section_h - title_pad * 2 - 24) // max(1, len(title_lines)))
+        title_font = _load_font(max(20, int(line_h * 0.82)))
     for i, line in enumerate(title_lines):
         draw.text((text_left, title_y_text + i * line_h), line,
                   font=title_font, fill=(50, 50, 55))
+    title_used_h = len(title_lines) * line_h
     if date_text:
-        date_y_text = title_y_text + title_block_h + 4
+        date_y_text = title_y_text + title_used_h + 6
         draw.text((text_left, date_y_text), date_text,
                   font=date_font, fill=(120, 120, 125))
-        article_top = date_y_text + 32
-    else:
-        article_top = title_y_text + title_block_h + 16
-    article_area_h = max(150, a4_h - article_top - 30)
+    article_top = article_section_top
 
-    # Fit the article into the article area
+    # Fit the article into the article area — fill the section (no
+    # vertical centering; preserve aspect ratio).
     a_w, a_h = article_img.size
     if a_h > 0 and a_w > 0:
-        scale = min(a4_w / a_w, article_area_h / a_h)
-        new_w = max(1, int(a_w * scale))
-        new_h = max(1, int(a_h * scale))
+        # Scale to fit width; if article is shorter than the area
+        # (after scaling), fine. If taller, clip to the area.
+        scale = a4_w / a_w
+        new_w = a4_w
+        new_h = int(a_h * scale)
+        if new_h > article_area_h:
+            # Re-scale to fit the area height instead
+            scale = article_area_h / a_h
+            new_w = max(1, int(a_w * scale))
+            new_h = article_area_h
         resized = article_img.resize((new_w, new_h), Image.LANCZOS)
-        x = (a4_w - new_w) // 2
-        y = article_top + max(0, (article_area_h - new_h) // 2)
+        x = 0  # full width — no horizontal centering
+        y = article_top  # top-aligned in the section
         border_pad = 4
         border_rect = [
             (x - border_pad, y - border_pad),
@@ -714,6 +760,7 @@ async def run_scrape_core(
     cancel_evt: Optional[threading.Event] = None,
     header_path: Optional[str] = None,
     header_layout: Optional[dict] = None,
+    section_heights: Optional[dict] = None,
 ) -> Optional[str]:
     """End-to-end scrape -> process -> combine. log_cb(str), progress_cb(float 0..1)."""
     def log(msg: str):
@@ -751,7 +798,12 @@ async def run_scrape_core(
                     log("    [!] Could not locate 'Bobby Mak' in raw PDF text.")
                 else:
                     log(f"    Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
-                a4 = make_a4_page_from_pdf(raw_pdf, bobby, header_path=header_path, header_layout=header_layout)
+                a4 = make_a4_page_from_pdf(
+                    raw_pdf, bobby,
+                    header_path=header_path,
+                    header_layout=header_layout,
+                    section_heights=section_heights,
+                )
                 if a4 is not None:
                     a4_pages.append(a4)
                     png_out = os.path.join(work_dir, f"article_{i:02d}.png")
@@ -1411,6 +1463,12 @@ class ScraperGUI:
             "h": None,           # auto from width + aspect
             "lock_aspect": True,
         }
+        # v4.3: A4 section heights (header bar, title/subject, article window)
+        # Sum should be ≈ A4_H_PX (1754). User can edit via the GUI.
+        self.header_section_h = tk.IntVar(value=220)
+        self.title_section_h = tk.IntVar(value=130)
+        self.article_section_h = tk.IntVar(value=1404)
+        self.height_preset_var = tk.StringVar(value="Balanced")
         # v4: where the GuidedManualDialog writes user-saved PDFs
         self.guided_pdfs_dir: Optional[str] = None
 
@@ -1447,7 +1505,7 @@ class ScraperGUI:
         ).pack(side="left")
         ttk.Label(
             title,
-            text="v4.2 — pick a mode, then Start",
+            text="v4.3 — pick a mode, then Start",
             foreground="#666",
         ).pack(side="left", padx=12)
 
@@ -1547,6 +1605,56 @@ class ScraperGUI:
             text="Add the Mingtiandi masthead to the top of every A4 page (replaces what @media print CSS hides)",
             variable=self.use_header_var,
         ).grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+
+        # v4.3: A4 section heights — user-adjustable
+        heights = ttk.LabelFrame(
+            root, text="4.  A4 section heights (px, sum should ≈ 1754)", padding=10
+        )
+        heights.pack(fill="x", padx=12, pady=6)
+        heights.columnconfigure(1, weight=1)
+
+        def add_height_row(parent, label, var, row, mn, mx, hint=""):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", **pad)
+            ttk.Spinbox(
+                parent, from_=mn, to=mx, textvariable=var, width=6, increment=10,
+                command=self._on_height_change,
+            ).grid(row=row, column=1, sticky="w", **pad)
+            ttk.Label(parent, text=hint, foreground="#777").grid(
+                row=row, column=2, sticky="w", **pad
+            )
+
+        add_height_row(heights, "Header bar height:",
+                       self.header_section_h, 0, 100, 600,
+                       "(Mingtiandi masthead)")
+        add_height_row(heights, "Subject section height:",
+                       self.title_section_h, 1, 60, 400,
+                       "(story subject + date)")
+        add_height_row(heights, "Article window height:",
+                       self.article_section_h, 2, 200, 1600,
+                       "(bordered scroll-down)")
+
+        # Preset dropdown
+        ttk.Label(heights, text="Preset:").grid(row=3, column=0, sticky="w", **pad)
+        preset_frame = ttk.Frame(heights)
+        preset_frame.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(preset_frame, textvariable=self.height_preset_var,
+                  foreground="#555", font=("Segoe UI", 9, "italic")).pack(side="left", padx=4)
+        ttk.Button(preset_frame, text="Compact", width=8,
+                   command=lambda: self._apply_preset("Compact")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Balanced", width=8,
+                   command=lambda: self._apply_preset("Balanced")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Spacious", width=8,
+                   command=lambda: self._apply_preset("Spacious")).pack(side="left", padx=2)
+        ttk.Button(preset_frame, text="Fill A4", width=8,
+                   command=self._fill_a4).pack(side="left", padx=2)
+
+        # v4.3: a running total showing how the three heights add up
+        self.height_total_var = tk.StringVar(value="")
+        ttk.Label(heights, textvariable=self.height_total_var,
+                  foreground="#0066cc", font=("Consolas", 9)).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0)
+        )
+        self.root.after(50, self._on_height_change)
 
         # Action buttons
         act = ttk.Frame(root)
@@ -1651,6 +1759,55 @@ class ScraperGUI:
             f"lock_aspect={new_layout['lock_aspect']}"
         )
 
+    # ---------------------- section heights (v4.3) ----------------------
+    PRESETS = {
+        "Compact":   {"header": 180, "title": 120, "article": 1454},
+        "Balanced":  {"header": 220, "title": 130, "article": 1404},
+        "Spacious":  {"header": 280, "title": 180, "article": 1294},
+    }
+
+    def _apply_preset(self, name: str):
+        p = self.PRESETS[name]
+        self.header_section_h.set(p["header"])
+        self.title_section_h.set(p["title"])
+        self.article_section_h.set(p["article"])
+        self.height_preset_var.set(name)
+        self._on_height_change()
+        self._log(f"[*] Heights preset: {name} (header={p['header']} title={p['title']} article={p['article']})")
+
+    def _fill_a4(self):
+        """Set the three heights so the sum is exactly 1754 (A4 height),
+        keeping the current header and article heights and adjusting
+        the title section to absorb the remainder."""
+        A4 = A4_W_PX, A4_H_PX  # (1240, 1754)
+        header = self.header_section_h.get()
+        article = self.article_section_h.get()
+        title = max(60, A4_H_PX - header - article)
+        self.title_section_h.set(title)
+        self.height_preset_var.set("Custom")
+        self._on_height_change()
+        self._log(f"[*] Heights filled to A4: header={header} title={title} article={article} (sum={header+title+article})")
+
+    def _on_height_change(self):
+        h = self.header_section_h.get()
+        t = self.title_section_h.get()
+        a = self.article_section_h.get()
+        total = h + t + a
+        a4 = A4_H_PX
+        if total == a4:
+            msg = f"Sum = {total}  (fills the 1754-px A4 exactly)"
+            color = "#228B22"  # green
+        elif total < a4:
+            msg = f"Sum = {total}  ({a4 - total} px of empty space below)"
+            color = "#aa8800"  # amber
+        else:
+            msg = f"Sum = {total}  ({total - a4} px over the A4 — will overflow)"
+            color = "#cc3333"  # red
+        try:
+            self.height_total_var.set(msg)
+        except Exception:
+            pass
+
     def _resolve_header_path(self) -> Optional[str]:
         if not self.use_header_var.get():
             return None
@@ -1660,6 +1817,13 @@ class ScraperGUI:
         if h:
             self._log(f"[!] Header file not found: {h} (running without header)")
         return None
+
+    def _resolve_section_heights(self) -> dict:
+        return {
+            "header": int(self.header_section_h.get()),
+            "title": int(self.title_section_h.get()),
+            "article": int(self.article_section_h.get()),
+        }
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
@@ -1820,6 +1984,7 @@ class ScraperGUI:
                         cancel_evt=self.cancel_evt,
                         header_path=self._resolve_header_path(),
                         header_layout=dict(self.header_layout),
+                        section_heights=self._resolve_section_heights(),
                     )
                 )
                 if result:
@@ -1886,6 +2051,7 @@ class ScraperGUI:
                         progress_cb=self._set_status,
                         header_path=self._resolve_header_path(),
                         header_layout=dict(self.header_layout),
+                        section_heights=self._resolve_section_heights(),
                     )
                     if out:
                         self._set_status("Done ✓", 1.0)
@@ -1933,6 +2099,7 @@ class ScraperGUI:
                     progress_cb=self._set_status,
                     header_path=self._resolve_header_path(),
                     header_layout=dict(self.header_layout),
+                    section_heights=self._resolve_section_heights(),
                 )
                 if out:
                     self._set_status("Done ✓", 1.0)
@@ -1975,6 +2142,7 @@ class ScraperGUI:
                     progress_cb=self._set_status,
                     header_path=self._resolve_header_path(),
                     header_layout=dict(self.header_layout),
+                    section_heights=self._resolve_section_heights(),
                 )
                 if out:
                     self._set_status("Done ✓", 1.0)
@@ -1999,6 +2167,7 @@ class ScraperGUI:
         progress_cb=None,
         header_path: Optional[str] = None,
         header_layout: Optional[dict] = None,
+        section_heights: Optional[dict] = None,
     ) -> Optional[str]:
         def log(msg: str):
             if log_cb:
@@ -2030,7 +2199,12 @@ class ScraperGUI:
                 log("      [!] No 'Bobby Mak' line found in text — page will still be cropped to A4")
             else:
                 log(f"      Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
-            a4 = make_a4_page_from_pdf(pdf_path, bobby, header_path=header_path, header_layout=header_layout)
+            a4 = make_a4_page_from_pdf(
+                pdf_path, bobby,
+                header_path=header_path,
+                header_layout=header_layout,
+                section_heights=section_heights,
+            )
             if a4 is not None:
                 a4_pages.append(a4)
             if progress_cb:
@@ -2084,6 +2258,7 @@ def run_pdf_chop_mode(
     pdf_input_dir: str, output_pdf: str, articles: list[dict],
     header_path: Optional[str] = None,
     header_layout: Optional[dict] = None,
+    section_heights: Optional[dict] = None,
 ) -> None:
     pdf_files = sorted(
         os.path.join(pdf_input_dir, f)
@@ -2097,7 +2272,12 @@ def run_pdf_chop_mode(
     for pdf_path in pdf_files:
         print(f"[*] {os.path.basename(pdf_path)}")
         bobby = find_bobby_mak_in_pdf(pdf_path)
-        a4 = make_a4_page_from_pdf(pdf_path, bobby, header_path=header_path)
+        a4 = make_a4_page_from_pdf(
+            pdf_path, bobby,
+            header_path=header_path,
+            header_layout=header_layout,
+            section_heights=section_heights,
+        )
         if a4 is not None:
             a4_pages.append(a4)
     if not a4_pages:
@@ -2114,7 +2294,7 @@ def run_pdf_chop_mode(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.2 — header + title + scroll cue)",
+        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.3 — user-adjustable A4 sections)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -2157,6 +2337,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Header height in px (default: 0 = auto from width + aspect)"
     )
     ap.add_argument(
+        "--section-header", type=int, default=220,
+        help="Height of the header bar section in px (default: 220)"
+    )
+    ap.add_argument(
+        "--section-title", type=int, default=130,
+        help="Height of the subject section in px (default: 130)"
+    )
+    ap.add_argument(
+        "--section-article", type=int, default=1404,
+        help="Height of the article window section in px (default: 1404)"
+    )
+    ap.add_argument(
         "--gui",
         action="store_true",
         help="Force the GUI even when other args are given (rarely needed)",
@@ -2184,6 +2376,11 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     header_path: Optional[str] = None
     header_layout = dict(DEFAULT_HEADER_LAYOUT)
+    section_heights = {
+        "header": args.section_header,
+        "title": args.section_title,
+        "article": args.section_article,
+    }
     if not args.no_header:
         if args.header and os.path.exists(args.header):
             header_path = args.header
@@ -2196,6 +2393,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         header_layout["h"] = args.header_h if args.header_h > 0 else None
         print(f"[*] Header layout: x={header_layout['x']} y={header_layout['y']} "
               f"w={header_layout['w']} h={header_layout['h']}")
+    print(f"[*] Section heights: header={section_heights['header']} "
+          f"title={section_heights['title']} article={section_heights['article']} "
+          f"(sum={sum(section_heights.values())})")
 
     articles: list[dict] = []
     if args.input and os.path.exists(args.input):
@@ -2216,13 +2416,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 user_agent=args.user_agent,
                 header_path=header_path,
                 header_layout=header_layout,
+                section_heights=section_heights,
             )
         )
     else:
         if not args.pdf_input or not os.path.isdir(args.pdf_input):
             print("[!] --pdf-input is required for pdf-chop mode.", file=sys.stderr)
             sys.exit(2)
-        run_pdf_chop_mode(args.pdf_input, args.output, articles, header_path=header_path, header_layout=header_layout)
+        run_pdf_chop_mode(args.pdf_input, args.output, articles, header_path=header_path, header_layout=header_layout, section_heights=section_heights)
 
 
 if __name__ == "__main__":

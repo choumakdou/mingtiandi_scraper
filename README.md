@@ -1,9 +1,33 @@
-# Mingtiandi Bobby Mak Quote PDF Builder (v4.2 — Header + Title + Scroll Cue)
+# Mingtiandi Bobby Mak Quote PDF Builder (v4.3 — User-Adjustable A4 Sections)
 
 A single tool that turns a list of Mingtiandi article URLs into a single
 A4-portrait PDF — one page per article, with the Mingtiandi masthead
 preserved and the paragraph where **Bobby Mak (CHFT Advisory)** is
 quoted highlighted in yellow.
+
+## What's new in v4.3
+
+- **Three A4 section heights, all user-adjustable in the GUI.** New
+  "4. A4 section heights" frame has spinboxes for **Header bar**,
+  **Subject**, and **Article window** heights, plus a live "Sum = N
+  (fills the 1754-px A4 exactly)" status line that goes green when
+  the three values add up to A4 height, amber when there's empty
+  space left, red when the values overflow.
+- **Preset buttons** — **Compact** (180/120/1454), **Balanced**
+  (220/130/1404), **Spacious** (280/180/1294), and a **Fill A4**
+  button that keeps the current header and article heights and
+  adjusts the subject section to absorb the remainder.
+- **Article section is now filled, not centered.** The source crop
+  window is sized to match the article section height, so the article
+  body fills the section from top to bottom — no more 30% white
+  space at the bottom of the A4 (v4.2 was wasting it because the
+  article was centered in a too-tall section).
+- **Fixed a silent Y-coordinate bug** that was throwing off the Bobby
+  Mak crop by ~1200 px on the saved PDF. Verified empirically with
+  an overlay against the rendered image. v4.2's output was
+  sometimes showing wrong content inside the highlight as a result.
+- **CLI flags** for the new heights: `--section-header`,
+  `--section-title`, `--section-article` (default 220/130/1404).
 
 ## What's new in v4.2
 
