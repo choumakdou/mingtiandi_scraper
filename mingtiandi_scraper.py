@@ -532,11 +532,17 @@ def make_a4_page_from_pdf(
             pass
 
     # ---- 3. Decide the crop window ----
-    # The article body lives on the Bobby-Mak page. We crop a window
-    # focused on Bobby Mak (1/3 above, 2/3 below) so the paragraph is
-    # prominent. We also remember the FULL page height as `full_h_px`
-    # so the scroll-bar thumb reflects where the visible window sits
-    # within the full page.
+    # Use the FULL Bobby-Mak page (no partial header on continuation
+    # pages of Mingtiandi articles, so the whole page is article
+    # body). Scale to fit the article section's height on the A4,
+    # which fills the section vertically (with side margins if the
+    # source aspect is narrower than the section). The article is
+    # then centered horizontally. This makes the A4 fully used.
+    #
+    # If the source page DOES have a partial header (page 1 of the
+    # article on some sites), we still want the page anyway —
+    # seeing the partial header at the top of the article is a
+    # small price for filling the A4.
     #
     # NOTE on Y coords: pdfplumber's "top" attribute is the distance
     # from the TOP of the page (top-origin), so converting to image
@@ -544,15 +550,11 @@ def make_a4_page_from_pdf(
     # an overlay against the rendered image.
     full_h_px = ph
     bobby_y_px_full = int((bobby_mak[1] if bobby_mak else 0) / 72.0 * DPI)
-    # Window budget: match the article section's pixel height on the
-    # A4 canvas, scaled back to source-page pixels. This way the
-    # article fills the section instead of being centered in a larger
-    # area (which is what was wasting ~30% of the A4 before).
-    art_section_h_px = int(section_heights.get("article", 1404))
-    scale_to_width = a4_w / pw
-    desired_window_h = int(art_section_h_px / scale_to_width)
-    src_crop_top = max(0, bobby_y_px_full - desired_window_h // 3)
-    src_crop_bottom = min(ph, src_crop_top + desired_window_h)
+    # Source crop: use the entire page (y=0 to y=ph). The article
+    # section height controls the A4 height; the source aspect
+    # controls the width (with side margins if narrower).
+    src_crop_top = 0
+    src_crop_bottom = ph
     src_crop_offset_y = src_crop_top
     article_img = primary.crop((0, src_crop_top, pw, src_crop_bottom))
 
@@ -671,22 +673,20 @@ def make_a4_page_from_pdf(
                   font=date_font, fill=(120, 120, 125))
     article_top = article_section_top
 
-    # Fit the article into the article area — fill the section (no
-    # vertical centering; preserve aspect ratio).
+    # Fit the article into the article area — fill the section
+    # vertically (preserve aspect ratio; center horizontally if the
+    # source is narrower than the section).
     a_w, a_h = article_img.size
     if a_h > 0 and a_w > 0:
-        # Scale to fit width; if article is shorter than the area
-        # (after scaling), fine. If taller, clip to the area.
-        scale = a4_w / a_w
-        new_w = a4_w
-        new_h = int(a_h * scale)
-        if new_h > article_area_h:
-            # Re-scale to fit the area height instead
-            scale = article_area_h / a_h
-            new_w = max(1, int(a_w * scale))
-            new_h = article_area_h
+        # Scale to fit the section height — this fills the section
+        # vertically. The article may be narrower than the section
+        # (side margins) but the A4 is fully used.
+        scale = article_area_h / a_h
+        new_w = max(1, int(a_w * scale))
+        new_h = article_area_h
         resized = article_img.resize((new_w, new_h), Image.LANCZOS)
-        x = 0  # full width — no horizontal centering
+        # Center horizontally
+        x = max(0, (a4_w - new_w) // 2)
         y = article_top  # top-aligned in the section
         border_pad = 4
         border_rect = [
