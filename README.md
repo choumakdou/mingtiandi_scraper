@@ -1,9 +1,28 @@
-# Mingtiandi Bobby Mak Quote PDF Builder (v4.3 — User-Adjustable A4 Sections)
+# Mingtiandi Bobby Mak Quote PDF Builder (v4.4 — Title Section Bridges into Article)
 
 A single tool that turns a list of Mingtiandi article URLs into a single
 A4-portrait PDF — one page per article, with the Mingtiandi masthead
 preserved and the paragraph where **Bobby Mak (CHFT Advisory)** is
 quoted highlighted in yellow.
+
+## What's new in v4.4
+
+- **Title section now bridges into the article body** before the
+  scrolled-down section starts. Default: 3 lines of the article's
+  opening paragraphs (e.g. "Homes at New World Development…",
+  "Chinachem is adding this building…") are rendered in the title
+  section below the byline, so the eye is led from the title
+  into the story before the article window starts.
+- New **"Intro lines in subject"** spinbox in the GUI (0–12, default
+  3). Set to 0 to revert to the old "title + date only" behaviour.
+- The article section's source crop now starts **after** the intro
+  so the same content isn't shown twice.
+- New default section heights:
+  - Header: 220, Subject: **260** (was 130), Article: **1274** (was 1404)
+  - The subject section is taller to accommodate the intro lines.
+- New **CLI flag** `--intro-lines N` (default 3).
+- New presets: Compact (220/1274), Balanced (260/1274), Spacious (320/1154)
+  for the new "title with intro" layout.
 
 ## What's new in v4.3
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Mingtiandi Bobby Mak Quote PDF Builder (v4.3 — user-adjustable A4 sections)
-============================================================================
+Mingtiandi Bobby Mak Quote PDF Builder (v4.4 — title section bridges into article body)
+================================================================================
 
 Opens each Mingtiandi article in your real Chrome, exports the page to
 PDF via Chrome's own print engine, then post-processes each PDF to
@@ -472,6 +472,9 @@ def make_a4_page_from_pdf(
         header_layout = {"x": 0, "y": 0, "w": A4_W_PX, "h": None, "lock_aspect": True}
     if section_heights is None:
         section_heights = {"header": 220, "title": 130, "article": 1404}
+    intro_lines_target = int(section_heights.get("intro_lines", 3))
+    # Default: no intro, so the source crop starts at the top of the page
+    intro_end_y_px = 0
 
     pages = pdf_to_images(pdf_path, dpi=200)
     if not pages:
@@ -552,8 +555,11 @@ def make_a4_page_from_pdf(
     bobby_y_px_full = int((bobby_mak[1] if bobby_mak else 0) / 72.0 * DPI)
     # Source crop: use the entire page (y=0 to y=ph). The article
     # section height controls the A4 height; the source aspect
-    # controls the width (with side margins if narrower).
-    src_crop_top = 0
+    # controls the width (with side margins if narrower). If the
+    # title section is showing an intro (the first N body lines),
+    # the source crop starts AFTER the intro so the article section
+    # doesn't duplicate the intro.
+    src_crop_top = max(0, intro_end_y_px)
     src_crop_bottom = ph
     src_crop_offset_y = src_crop_top
     article_img = primary.crop((0, src_crop_top, pw, src_crop_bottom))
@@ -667,10 +673,75 @@ def make_a4_page_from_pdf(
         draw.text((text_left, title_y_text + i * line_h), line,
                   font=title_font, fill=(50, 50, 55))
     title_used_h = len(title_lines) * line_h
+
+    # ---- 5c. Render the intro (first N lines of the article body) ----
+    # The user-configured intro_lines count says how many body lines to
+    # bridge from the title section into the scrolled-down section.
+    # The intro_text_lines list is built in step 1 from pdfplumber.
+    intro_text: list[str] = []
+    intro_end_y_px = 0  # the y-position (in source image) where the
+                         # intro ends and the article section begins.
+                         # 0 = no intro, start at the top of the source.
+    if bobby_mak and intro_lines_target > 0:
+        try:
+            with pdfplumber.open(pdf_path) as ppdf:
+                ppage = ppdf.pages[bobby_mak[0]]
+                body_lines = []  # (y_pt_top, text) tuples
+                for ln in ppage.extract_text_lines() or []:
+                    top_pt = float(ln.get("top", 0))
+                    text = (ln.get("text") or "").strip()
+                    if text:
+                        body_lines.append((top_pt, text))
+                # Take the first N lines as the intro
+                for i in range(min(intro_lines_target, len(body_lines))):
+                    intro_text.append(body_lines[i][1])
+                # The intro ends at the bottom of the last intro line
+                if intro_text and len(intro_text) < len(body_lines):
+                    next_top_pt = body_lines[len(intro_text)][0]
+                    intro_end_y_px = int(next_top_pt / 72.0 * DPI) - 6
+                elif intro_text:
+                    # Intro consumes all body lines on this page; the
+                    # article section will still start at the top of
+                    # the page (no offset).
+                    last_bottom_pt = float(
+                        ppage.extract_text_lines()[-1].get(
+                            "bottom", body_lines[-1][0] + 18
+                        )
+                    )
+                    intro_end_y_px = int(last_bottom_pt / 72.0 * DPI) + 6
+        except Exception:
+            intro_text = []
+            intro_end_y_px = 0
+    # If the title section is too small to fit the intro, hide it
+    intro_y_text = title_y_text + title_used_h + 6
     if date_text:
-        date_y_text = title_y_text + title_used_h + 6
+        date_y_text = intro_y_text
         draw.text((text_left, date_y_text), date_text,
                   font=date_font, fill=(120, 120, 125))
+        intro_y_text = date_y_text + 30  # gap below date
+    if intro_text:
+        intro_font = _load_font(18)
+        intro_line_h = 26
+        available_h = title_section_top + title_section_h - intro_y_text - 14
+        max_intro_lines = max(0, available_h // intro_line_h)
+        actual_intro = intro_text[:max_intro_lines]
+        for i, line in enumerate(actual_intro):
+            # Word-wrap if the line is too long for the section
+            words = line.split()
+            cur = ""
+            for w in words:
+                test = (cur + " " + w).strip()
+                bbox = draw.textbbox((0, 0), test, font=intro_font)
+                if bbox[2] - bbox[0] <= text_right - text_left or not cur:
+                    cur = test
+                else:
+                    draw.text((text_left, intro_y_text + i * intro_line_h),
+                              cur, font=intro_font, fill=(80, 80, 85))
+                    i += 1
+                    cur = w
+            if cur:
+                draw.text((text_left, intro_y_text + i * intro_line_h),
+                          cur, font=intro_font, fill=(80, 80, 85))
     article_top = article_section_top
 
     # Fit the article into the article area — fill the section
@@ -1466,8 +1537,11 @@ class ScraperGUI:
         # v4.3: A4 section heights (header bar, title/subject, article window)
         # Sum should be ≈ A4_H_PX (1754). User can edit via the GUI.
         self.header_section_h = tk.IntVar(value=220)
-        self.title_section_h = tk.IntVar(value=130)
-        self.article_section_h = tk.IntVar(value=1404)
+        self.title_section_h = tk.IntVar(value=260)
+        self.article_section_h = tk.IntVar(value=1274)
+        # v4.4: how many lines of article body the title section should
+        # show between the date and the scrolled-down section.
+        self.intro_lines = tk.IntVar(value=3)
         self.height_preset_var = tk.StringVar(value="Balanced")
         # v4: where the GuidedManualDialog writes user-saved PDFs
         self.guided_pdfs_dir: Optional[str] = None
@@ -1505,7 +1579,7 @@ class ScraperGUI:
         ).pack(side="left")
         ttk.Label(
             title,
-            text="v4.3 — pick a mode, then Start",
+            text="v4.4 — pick a mode, then Start",
             foreground="#666",
         ).pack(side="left", padx=12)
 
@@ -1632,6 +1706,19 @@ class ScraperGUI:
         add_height_row(heights, "Article window height:",
                        self.article_section_h, 2, 200, 1600,
                        "(bordered scroll-down)")
+
+        # v4.4: Intro lines in the subject section (between date and
+        # the scroll-down article). Shows the first N lines of the
+        # article body so the title section bridges into the story.
+        ttk.Label(heights, text="Intro lines in subject:").grid(
+            row=3, column=0, sticky="w", **pad
+        )
+        ttk.Spinbox(
+            heights, from_=0, to=12, textvariable=self.intro_lines, width=6, increment=1,
+            command=self._on_height_change,
+        ).grid(row=3, column=1, sticky="w", **pad)
+        ttk.Label(heights, text="(body lines between date and scroll-down)",
+                  foreground="#777").grid(row=3, column=2, sticky="w", **pad)
 
         # Preset dropdown
         ttk.Label(heights, text="Preset:").grid(row=3, column=0, sticky="w", **pad)
@@ -1761,9 +1848,9 @@ class ScraperGUI:
 
     # ---------------------- section heights (v4.3) ----------------------
     PRESETS = {
-        "Compact":   {"header": 180, "title": 120, "article": 1454},
-        "Balanced":  {"header": 220, "title": 130, "article": 1404},
-        "Spacious":  {"header": 280, "title": 180, "article": 1294},
+        "Compact":   {"header": 180, "title": 220, "article": 1354},
+        "Balanced":  {"header": 220, "title": 260, "article": 1274},
+        "Spacious":  {"header": 280, "title": 320, "article": 1154},
     }
 
     def _apply_preset(self, name: str):
@@ -1823,6 +1910,7 @@ class ScraperGUI:
             "header": int(self.header_section_h.get()),
             "title": int(self.title_section_h.get()),
             "article": int(self.article_section_h.get()),
+            "intro_lines": int(self.intro_lines.get()),
         }
 
     def _on_mode_change(self):
@@ -2294,7 +2382,7 @@ def run_pdf_chop_mode(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.3 — user-adjustable A4 sections)",
+        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.4 — title section bridges into article body)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -2341,12 +2429,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Height of the header bar section in px (default: 220)"
     )
     ap.add_argument(
-        "--section-title", type=int, default=130,
-        help="Height of the subject section in px (default: 130)"
+        "--section-title", type=int, default=260,
+        help="Height of the subject section in px (default: 260 — "
+             "includes title, date and a few intro lines)"
     )
     ap.add_argument(
-        "--section-article", type=int, default=1404,
-        help="Height of the article window section in px (default: 1404)"
+        "--section-article", type=int, default=1274,
+        help="Height of the article window section in px (default: 1274)"
+    )
+    ap.add_argument(
+        "--intro-lines", type=int, default=3,
+        help="Number of body lines to bridge from the date into the "
+             "scrolled-down section (default: 3)"
     )
     ap.add_argument(
         "--gui",
@@ -2380,6 +2474,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "header": args.section_header,
         "title": args.section_title,
         "article": args.section_article,
+        "intro_lines": args.intro_lines,
     }
     if not args.no_header:
         if args.header and os.path.exists(args.header):
