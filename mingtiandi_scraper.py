@@ -414,19 +414,37 @@ def _find_title_and_date(pdf_path: str) -> tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def _load_font(size: int):
-    """Load a sans-serif TTF font, with fallbacks for Windows / macOS / Linux."""
-    candidates = [
-        "C:\\Windows\\Fonts\\segoeuib.ttf",   # Segoe UI Bold (Win)
-        "C:\\Windows\\Fonts\\arialbd.ttf",    # Arial Bold (Win)
-        "C:\\Windows\\Fonts\\arial.ttf",      # Arial (Win)
-        "C:\\Windows\\Fonts\\segoeui.ttf",    # Segoe UI (Win)
-        "/System/Library/Fonts/Helvetica.ttc",  # macOS
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    ]
+def _load_font(size: int, weight: str = "regular"):
+    """Load a sans-serif TTF font that matches Mingtiandi's look.
+
+    weight: 'regular', 'bold', or 'black'. Mingtiandi's title is
+    rendered in a heavy sans-serif, so the title uses 'black' (Arial
+    Black / Segoe UI Black) when available. The byline and intro
+    use 'regular' (Arial / Helvetica / Liberation Sans).
+    """
+    candidates: list[str] = []
+    if weight in ("black", "bold"):
+        # Heaviest weights first; fall back to bold variants.
+        candidates += [
+            "C:\\Windows\\Fonts\\ariblk.ttf",          # Arial Black (Win)
+            "C:\\Windows\\Fonts\\seguiblk.ttf",        # Segoe UI Black (Win)
+            "C:\\Windows\\Fonts\\arialbd.ttf",         # Arial Bold (Win)
+            "C:\\Windows\\Fonts\\segoeuib.ttf",        # Segoe UI Bold (Win)
+            "/System/Library/Fonts/Helvetica.ttc",     # macOS Helvetica
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        ]
+    if weight == "regular":
+        candidates += [
+            "C:\\Windows\\Fonts\\arial.ttf",           # Arial (Win)
+            "C:\\Windows\\Fonts\\segoeui.ttf",         # Segoe UI (Win)
+            "/System/Library/Fonts/Helvetica.ttc",     # macOS
+            "/Library/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ]
     for c in candidates:
         if os.path.exists(c):
             try:
@@ -471,7 +489,7 @@ def make_a4_page_from_pdf(
     if header_layout is None:
         header_layout = {"x": 0, "y": 0, "w": A4_W_PX, "h": None, "lock_aspect": True}
     if section_heights is None:
-        section_heights = {"header": 220, "title": 130, "article": 1404}
+        section_heights = {"header": 220, "title": 260, "article": 1274}
     intro_lines_target = int(section_heights.get("intro_lines", 3))
     # Default: no intro, so the source crop starts at the top of the page
     intro_end_y_px = 0
@@ -629,8 +647,8 @@ def make_a4_page_from_pdf(
     # Use the user-specified section heights so the layout uses the
     # whole A4 page.
     draw = ImageDraw.Draw(canvas)
-    title_font = _load_font(38)
-    date_font = _load_font(18)
+    title_font = _load_font(40, "black")
+    date_font = _load_font(18, "regular")
     text_left = 40
     text_right = a4_w - 60  # leave room for the scroll bar
 
@@ -671,7 +689,7 @@ def make_a4_page_from_pdf(
         title_font = _load_font(max(20, int(line_h * 0.82)))
     for i, line in enumerate(title_lines):
         draw.text((text_left, title_y_text + i * line_h), line,
-                  font=title_font, fill=(50, 50, 55))
+                  font=title_font, fill=(38, 38, 42), spacing=1)
     title_used_h = len(title_lines) * line_h
 
     # ---- 5c. Render the intro (first N lines of the article body) ----
@@ -717,10 +735,10 @@ def make_a4_page_from_pdf(
     if date_text:
         date_y_text = intro_y_text
         draw.text((text_left, date_y_text), date_text,
-                  font=date_font, fill=(120, 120, 125))
+                  font=date_font, fill=(120, 120, 130))
         intro_y_text = date_y_text + 30  # gap below date
     if intro_text:
-        intro_font = _load_font(18)
+        intro_font = _load_font(18, "regular")
         intro_line_h = 26
         available_h = title_section_top + title_section_h - intro_y_text - 14
         max_intro_lines = max(0, available_h // intro_line_h)
@@ -736,12 +754,12 @@ def make_a4_page_from_pdf(
                     cur = test
                 else:
                     draw.text((text_left, intro_y_text + i * intro_line_h),
-                              cur, font=intro_font, fill=(80, 80, 85))
+                              cur, font=intro_font, fill=(75, 75, 80))
                     i += 1
                     cur = w
             if cur:
                 draw.text((text_left, intro_y_text + i * intro_line_h),
-                          cur, font=intro_font, fill=(80, 80, 85))
+                          cur, font=intro_font, fill=(75, 75, 80))
     article_top = article_section_top
 
     # Fit the article into the article area — fill the section
