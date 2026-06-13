@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Mingtiandi Bobby Mak Quote PDF Builder (v3 — GUI edition)
-=========================================================
+Mingtiandi Bobby Mak Quote PDF Builder (v4.1 — GUI + header restoration)
+====================================================================
 
 Opens each Mingtiandi article in your real Chrome, exports the page to
 PDF via Chrome's own print engine, then post-processes each PDF to
@@ -332,9 +332,29 @@ def find_bobby_mak_in_pdf(pdf_path: str) -> Optional[tuple[int, float]]:
     return None
 
 
+# Path to the default Mingtiandi header image (lives next to the script)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_HEADER_PNG = os.path.join(SCRIPT_DIR, "default_header.png")
+
+
 def make_a4_page_from_pdf(
-    pdf_path: str, bobby_mak: Optional[tuple[int, float]]
+    pdf_path: str,
+    bobby_mak: Optional[tuple[int, float]],
+    header_path: Optional[str] = None,
 ) -> Optional[Image.Image]:
+    """Build one A4 page from a PDF.
+
+    Steps:
+      1. Convert the Bobby-Mak page of the PDF to a 200-DPI image.
+      2. Skip the partial header at the top of the PDF (the one Chrome's
+         @media print CSS leaves behind — social icons + nav menu but no
+         logo).
+      3. Optionally focus the crop around the Bobby Mak line if the
+         article is longer than one A4 page.
+      4. Paste the supplied header image at the top of a white A4 canvas
+         (so the page looks like the live site), and drop the article
+         content below it.
+    """
     pages = [img.convert("RGB") for img in convert_from_path(pdf_path, dpi=200)]
     if not pages:
         return None
@@ -342,21 +362,137 @@ def make_a4_page_from_pdf(
     primary = pages[target_idx]
     pw, ph = primary.size
     a4_w, a4_h = A4_W_PX, A4_H_PX
-    if ph <= a4_h:
-        return _center_on_a4(primary, a4_w, a4_h)
+
+    # Heuristic: the print-CSS-bleed header (social icons + nav menu but
+    # no logo) takes roughly the top 30% of an A4 page at 200 DPI.
+    partial_header_h = int(ph * 0.30)
+    content_y0 = partial_header_h
+    content_h_total = ph - content_y0
+
+    # Apply Bobby-Mak focus within the content area if it's taller than
+    # what fits below the header.
     DPI = 200
-    if bobby_mak:
+    header_h_on_a4 = 0
+    if header_path and os.path.exists(header_path):
+        try:
+            with Image.open(header_path) as h:
+                header_h_on_a4 = int(h.height * (a4_w / h.width))
+        except Exception:
+            header_h_on_a4 = 0
+    article_budget = a4_h - header_h_on_a4
+
+    crop_offset_y = 0  # y in the *original* page where article_img starts
+    if bobby_mak and content_h_total > article_budget:
         _, bobby_y_pt = bobby_mak
-        bobby_y_px = int(bobby_y_pt / 72.0 * DPI)
-        crop_top = max(0, bobby_y_px - ph // 3)
-        crop_bottom = min(ph, crop_top + a4_h)
-        if crop_bottom - crop_top < a4_h and ph >= a4_h:
-            crop_bottom = ph
-            crop_top = max(0, crop_bottom - a4_h)
-        cropped = primary.crop((0, crop_top, pw, crop_bottom))
-        return _center_on_a4(cropped, a4_w, a4_h)
-    cropped = primary.crop((0, 0, pw, min(ph, a4_h)))
-    return _center_on_a4(cropped, a4_w, a4_h)
+        bobby_y_px = int(bobby_y_pt / 72.0 * DPI) - content_y0
+        crop_top = max(0, bobby_y_px - content_h_total // 3)
+        crop_bottom = min(content_h_total, crop_top + article_budget)
+        if crop_bottom - crop_top < article_budget and content_h_total >= article_budget:
+            crop_bottom = content_h_total
+            crop_top = max(0, crop_bottom - article_budget)
+        article_img = primary.crop(
+            (0, content_y0 + crop_top, pw, content_y0 + crop_bottom)
+        )
+        crop_offset_y = content_y0 + crop_top
+    elif content_h_total <= article_budget:
+        article_img = primary.crop((0, content_y0, pw, ph))
+        crop_offset_y = content_y0
+    else:
+        # Long article, no Bobby Mak found — just take the top of the content
+        article_img = primary.crop((0, content_y0, pw, content_y0 + article_budget))
+        crop_offset_y = content_y0
+
+    # Yellow highlight on the Bobby Mak paragraph (chop-mode only — the
+    # auto-scrape mode injects CSS for this). Find the paragraph's start
+    # in the cropped image and paint a yellow rectangle with a gold left
+    # border, matching the auto-scrape CSS.
+    if bobby_mak:
+        from PIL import ImageDraw
+        _, bobby_y_pt = bobby_mak
+        bobby_y_px_in_cropped = int(bobby_y_pt / 72.0 * DPI) - crop_offset_y
+        para_height_px = 200  # default fallback
+        try:
+            with pdfplumber.open(pdf_path) as ppdf:
+                ppage = ppdf.pages[min(bobby_mak[0], len(ppdf.pages) - 1)]
+                lines = ppage.extract_text_lines() or []
+                # Find Bobby Mak line
+                bobby_line = None
+                for ln in lines:
+                    if "Bobby Mak" in (ln.get("text") or "") and len(ln.get("text") or "") < 1200:
+                        bobby_line = ln
+                        break
+                if bobby_line is not None:
+                    bobby_top = float(bobby_line.get("top", 0))
+                    # All lines after Bobby Mak
+                    post_lines = [ln for ln in lines if float(ln.get("top", 0)) >= bobby_top]
+                    # Typical line height = the gap between the first two
+                    # post-Bobby lines (assumes body text is uniform)
+                    if len(post_lines) >= 2:
+                        typical_gap = (
+                            float(post_lines[1].get("top", 0))
+                            - float(post_lines[0].get("top", 0))
+                        )
+                    else:
+                        typical_gap = 18
+                    # Find the first gap > 1.6x typical_gap = paragraph end
+                    para_end_pt = bobby_top + 4 * typical_gap
+                    for i in range(1, len(post_lines)):
+                        prev = post_lines[i - 1]
+                        cur = post_lines[i]
+                        prev_top = float(prev.get("top", 0))
+                        cur_top = float(cur.get("top", 0))
+                        if cur_top - prev_top > typical_gap * 1.6:
+                            para_end_pt = prev_top + typical_gap
+                            break
+                    else:
+                        # Never broke — paragraph goes to the end of the page
+                        if post_lines:
+                            last = post_lines[-1]
+                            para_end_pt = float(last.get("bottom", last.get("top", 0) + typical_gap))
+                    para_height_px = int((para_end_pt - bobby_top) / 72.0 * DPI) + 4
+        except Exception:
+            pass
+        highlight_y0 = max(0, bobby_y_px_in_cropped - 6)
+        highlight_y1 = min(article_img.height, bobby_y_px_in_cropped + para_height_px)
+        if highlight_y1 > highlight_y0:
+            # Alpha-composite the highlight so the text shows through
+            article_rgba = article_img.convert("RGBA")
+            overlay = Image.new("RGBA", article_img.size, (0, 0, 0, 0))
+            odraw = ImageDraw.Draw(overlay)
+            odraw.rectangle(
+                [(0, highlight_y0), (article_img.width, highlight_y1)],
+                fill=(255, 245, 157, 220),  # #fff59d, ~86% opacity
+            )
+            odraw.rectangle(
+                [(0, highlight_y0), (4, highlight_y1)],
+                fill=(246, 192, 38, 255),  # #f6c026, full opacity
+            )
+            article_rgba = Image.alpha_composite(article_rgba, overlay)
+            article_img = article_rgba.convert("RGB")
+
+    # Build the A4 canvas
+    canvas = Image.new("RGB", (a4_w, a4_h), "white")
+    if header_h_on_a4 > 0 and header_path and os.path.exists(header_path):
+        try:
+            header = Image.open(header_path).convert("RGB")
+            header = header.resize((a4_w, header_h_on_a4), Image.LANCZOS)
+            canvas.paste(header, (0, 0))
+        except Exception as e:
+            print(f"    [!] Header paste failed: {e}", flush=True)
+            header_h_on_a4 = 0
+
+    # Fit the article content into the space below the header
+    content_h = a4_h - header_h_on_a4
+    a_w, a_h = article_img.size
+    if a_h > 0 and a_w > 0:
+        scale = min(a4_w / a_w, content_h / a_h)
+        new_w = max(1, int(a_w * scale))
+        new_h = max(1, int(a_h * scale))
+        resized = article_img.resize((new_w, new_h), Image.LANCZOS)
+        x = (a4_w - new_w) // 2
+        y = header_h_on_a4 + max(0, (content_h - new_h) // 2)
+        canvas.paste(resized, (x, y))
+    return canvas
 
 
 def _center_on_a4(img: Image.Image, a4_w: int, a4_h: int) -> Image.Image:
@@ -381,6 +517,7 @@ async def run_scrape_core(
     log_cb=None,
     progress_cb=None,
     cancel_evt: Optional[threading.Event] = None,
+    header_path: Optional[str] = None,
 ) -> Optional[str]:
     """End-to-end scrape -> process -> combine. log_cb(str), progress_cb(float 0..1)."""
     def log(msg: str):
@@ -392,6 +529,7 @@ async def run_scrape_core(
     log(f"[*] Loaded {len(articles)} articles")
     log(f"[*] Output: {output_pdf}")
     log(f"[*] Chrome: {chrome_path or 'bundled Chromium (Cloudflare will likely block)'}")
+    log(f"[*] Header image: {header_path or '(none)'}")
 
     work_dir = os.path.join(os.path.dirname(output_pdf) or ".", "_scratch")
     os.makedirs(work_dir, exist_ok=True)
@@ -417,7 +555,7 @@ async def run_scrape_core(
                     log("    [!] Could not locate 'Bobby Mak' in raw PDF text.")
                 else:
                     log(f"    Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
-                a4 = make_a4_page_from_pdf(raw_pdf, bobby)
+                a4 = make_a4_page_from_pdf(raw_pdf, bobby, header_path=header_path)
                 if a4 is not None:
                     a4_pages.append(a4)
                     png_out = os.path.join(work_dir, f"article_{i:02d}.png")
@@ -801,6 +939,9 @@ class ScraperGUI:
         self.progress_var = tk.DoubleVar(value=0.0)
         # v4: mode selector
         self.mode_var = tk.StringVar(value="guided")  # default to guided (Cloudflare-friendly)
+        # v4.1: header image (defaults to the bundled default_header.png)
+        self.header_var = tk.StringVar(value=DEFAULT_HEADER_PNG)
+        self.use_header_var = tk.BooleanVar(value=True)
         # v4: where the GuidedManualDialog writes user-saved PDFs
         self.guided_pdfs_dir: Optional[str] = None
 
@@ -837,7 +978,7 @@ class ScraperGUI:
         ).pack(side="left")
         ttk.Label(
             title,
-            text="v4 — pick a mode, then Start",
+            text="v4.1 — pick a mode, then Start",
             foreground="#666",
         ).pack(side="left", padx=12)
 
@@ -896,6 +1037,18 @@ class ScraperGUI:
         )
         self.pdfs_dir_btn.grid(row=3, column=2, **pad)
 
+        # v4.1: Header image (Mingtiandi masthead to paste at the top of
+        # every A4 page — Chrome's @media print CSS hides the logo on
+        # Save-as-PDF, so we re-add it here)
+        self.header_label = ttk.Label(frm, text="Header image:")
+        self.header_label.grid(row=4, column=0, sticky="w", **pad)
+        self.header_entry = ttk.Entry(frm, textvariable=self.header_var)
+        self.header_entry.grid(row=4, column=1, sticky="ew", **pad)
+        self.header_btn = ttk.Button(
+            frm, text="Browse…", command=self._browse_header
+        )
+        self.header_btn.grid(row=4, column=2, **pad)
+
         # Options section
         opt = ttk.LabelFrame(root, text="3.  Options", padding=10)
         opt.pack(fill="x", padx=12, pady=6)
@@ -915,6 +1068,11 @@ class ScraperGUI:
             text="Show the browser while scraping  (un-check to run hidden)",
             variable=self.watch_var,
         ).grid(row=1, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(
+            opt,
+            text="Add the Mingtiandi masthead to the top of every A4 page (replaces what @media print CSS hides)",
+            variable=self.use_header_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", **pad)
 
         # Action buttons
         act = ttk.Frame(root)
@@ -989,6 +1147,25 @@ class ScraperGUI:
         if path:
             self.pdfs_dir_var.set(path)
             self._log(f"PDFs folder: {path}")
+
+    def _browse_header(self):
+        path = self._filedialog.askopenfilename(
+            title="Pick a header PNG (Mingtiandi masthead)",
+            filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
+        )
+        if path:
+            self.header_var.set(path)
+            self._log(f"Header image: {path}")
+
+    def _resolve_header_path(self) -> Optional[str]:
+        if not self.use_header_var.get():
+            return None
+        h = self.header_var.get().strip()
+        if h and os.path.exists(h):
+            return h
+        if h:
+            self._log(f"[!] Header file not found: {h} (running without header)")
+        return None
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
@@ -1147,6 +1324,7 @@ class ScraperGUI:
                         log_cb=gui_log,
                         progress_cb=gui_prog,
                         cancel_evt=self.cancel_evt,
+                        header_path=self._resolve_header_path(),
                     )
                 )
                 if result:
@@ -1211,6 +1389,7 @@ class ScraperGUI:
                         output_pdf,
                         log_cb=self._log,
                         progress_cb=self._set_status,
+                        header_path=self._resolve_header_path(),
                     )
                     if out:
                         self._set_status("Done ✓", 1.0)
@@ -1256,6 +1435,7 @@ class ScraperGUI:
                     output_pdf,
                     log_cb=self._log,
                     progress_cb=self._set_status,
+                    header_path=self._resolve_header_path(),
                 )
                 if out:
                     self._set_status("Done ✓", 1.0)
@@ -1296,6 +1476,7 @@ class ScraperGUI:
                     output_pdf,
                     log_cb=self._log,
                     progress_cb=self._set_status,
+                    header_path=self._resolve_header_path(),
                 )
                 if out:
                     self._set_status("Done ✓", 1.0)
@@ -1318,12 +1499,18 @@ class ScraperGUI:
         output_pdf: str,
         log_cb=None,
         progress_cb=None,
+        header_path: Optional[str] = None,
     ) -> Optional[str]:
         def log(msg: str):
             if log_cb:
                 log_cb(msg)
             else:
                 print(msg, flush=True)
+
+        if header_path and os.path.exists(header_path):
+            log(f"[*] Using header image: {header_path}")
+        else:
+            log("[*] No header image — pages will have no Mingtiandi masthead")
 
         log(f"[*] Scanning {pdfs_dir} for PDFs…")
         pdf_files = sorted(
@@ -1344,7 +1531,7 @@ class ScraperGUI:
                 log("      [!] No 'Bobby Mak' line found in text — page will still be cropped to A4")
             else:
                 log(f"      Bobby Mak on page {bobby[0]+1}, y={bobby[1]:.0f}pt")
-            a4 = make_a4_page_from_pdf(pdf_path, bobby)
+            a4 = make_a4_page_from_pdf(pdf_path, bobby, header_path=header_path)
             if a4 is not None:
                 a4_pages.append(a4)
             if progress_cb:
@@ -1395,7 +1582,8 @@ class ScraperGUI:
 
 
 def run_pdf_chop_mode(
-    pdf_input_dir: str, output_pdf: str, articles: list[dict]
+    pdf_input_dir: str, output_pdf: str, articles: list[dict],
+    header_path: Optional[str] = None,
 ) -> None:
     pdf_files = sorted(
         os.path.join(pdf_input_dir, f)
@@ -1409,7 +1597,7 @@ def run_pdf_chop_mode(
     for pdf_path in pdf_files:
         print(f"[*] {os.path.basename(pdf_path)}")
         bobby = find_bobby_mak_in_pdf(pdf_path)
-        a4 = make_a4_page_from_pdf(pdf_path, bobby)
+        a4 = make_a4_page_from_pdf(pdf_path, bobby, header_path=header_path)
         if a4 is not None:
             a4_pages.append(a4)
     if not a4_pages:
@@ -1426,7 +1614,7 @@ def run_pdf_chop_mode(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Mingtiandi Bobby Mak Quote PDF Builder (v3 — GUI edition)",
+        description="Mingtiandi Bobby Mak Quote PDF Builder (v4.1 — GUI + header restoration)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -1442,6 +1630,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--chrome", help="Path to a real Chrome executable")
     ap.add_argument("--no-headless", action="store_true", help="Show Chrome windows")
     ap.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    ap.add_argument(
+        "--header",
+        default=DEFAULT_HEADER_PNG,
+        help=f"PNG to paste at the top of every A4 page (default: {DEFAULT_HEADER_PNG})",
+    )
+    ap.add_argument(
+        "--no-header",
+        action="store_true",
+        help="Skip the header banner (use the raw page only)",
+    )
     ap.add_argument(
         "--gui",
         action="store_true",
@@ -1468,6 +1666,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         ScraperGUI().run()
         return
 
+    header_path: Optional[str] = None
+    if not args.no_header:
+        if args.header and os.path.exists(args.header):
+            header_path = args.header
+            print(f"[*] Header image: {header_path}")
+        elif args.header and args.header != DEFAULT_HEADER_PNG:
+            print(f"[!] Header file not found: {args.header}")
+
     articles: list[dict] = []
     if args.input and os.path.exists(args.input):
         articles = read_articles(args.input)
@@ -1485,13 +1691,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 chrome_path=chrome_path,
                 headless=not args.no_headless,
                 user_agent=args.user_agent,
+                header_path=header_path,
             )
         )
     else:
         if not args.pdf_input or not os.path.isdir(args.pdf_input):
             print("[!] --pdf-input is required for pdf-chop mode.", file=sys.stderr)
             sys.exit(2)
-        run_pdf_chop_mode(args.pdf_input, args.output, articles)
+        run_pdf_chop_mode(args.pdf_input, args.output, articles, header_path=header_path)
 
 
 if __name__ == "__main__":

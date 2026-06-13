@@ -1,11 +1,30 @@
-# Mingtiandi Bobby Mak Quote PDF Builder (v4 — Guided Manual edition)
+# Mingtiandi Bobby Mak Quote PDF Builder (v4.1 — Guided Manual + Header Restoration)
 
 A single tool that turns a list of Mingtiandi article URLs into a single
 A4-portrait PDF — one page per article, with the Mingtiandi masthead
 preserved and the paragraph where **Bobby Mak (CHFT Advisory)** is
 quoted highlighted in yellow.
 
-## What's new in v4
+## What's new in v4.1
+
+- **Mingtiandi header restored**. When you do `Ctrl+P` → "Save as PDF"
+  in Chrome, the site's `@media print` CSS strips the big MINGTIANDI
+  logo and the "APAC REAL ESTATE INTELLIGENCE" tagline — only the nav
+  menu survives. The tool now re-adds the full masthead (logo +
+  tagline + social icons + subscribe + search + nav menu) at the top
+  of every A4 page. The header PNG is bundled as `default_header.png`
+  next to the script; pick a different PNG in the GUI if you want
+  your own. Toggle on/off with the "Add the Mingtiandi masthead…"
+  checkbox in the Options section.
+- **Programmatic Bobby Mak highlight** for chop mode (was only
+  working in auto-scrape via CSS). The tool now paints a yellow
+  rectangle (with a gold left border, matching the auto-scrape CSS)
+  over the Bobby Mak paragraph in the saved PDF — text shows through
+  via alpha compositing.
+- `partial header` (top 30% of the saved PDF) is auto-cropped before
+  compositing the new header, so the nav menu doesn't appear twice.
+
+## What's new in v4 (kept)
 
 - **Three modes** (radio buttons at the top of the GUI):
   - **🤖 Auto scrape** — headless Chrome tries to load every article
@@ -19,8 +38,7 @@ quoted highlighted in yellow.
 - **Re-combine button** — re-runs the chop pipeline on the most recent
   guided-run folder (or any folder you pick)
 - **PDFs folder field** — only enabled in Combine mode
-- **Status bar** shows the current mode and progress in plain English
-- **Live log** still streams every step
+- **Live log** streams every step
 
 ## v4 is for you if Cloudflare is blocking the headless scraper
 
