@@ -571,6 +571,26 @@ def make_a4_page_from_pdf(
     # an overlay against the rendered image.
     full_h_px = ph
     bobby_y_px_full = int((bobby_mak[1] if bobby_mak else 0) / 72.0 * DPI)
+    # v4.5: Compute intro_end_y_px HERE (before article_img) so the
+    # article section doesn't include the intro lines. The intro is
+    # rendered as text in the title section; the article section
+    # must start AFTER the intro to avoid duplication.
+    if bobby_mak and intro_lines_target > 0 and intro_end_y_px == 0:
+        try:
+            with pdfplumber.open(pdf_path) as _ppdf:
+                _ppage = _ppdf.pages[bobby_mak[0]]
+                _body_lines = []
+                for _ln in _ppage.extract_text_lines() or []:
+                    _top = float(_ln.get("top", 0))
+                    _text = (_ln.get("text") or "").strip()
+                    if _text:
+                        _body_lines.append((_top, _text))
+                if len(_body_lines) > intro_lines_target:
+                    intro_end_y_px = int(
+                        _body_lines[intro_lines_target][0] / 72.0 * DPI
+                    ) - 6
+        except Exception:
+            pass
     # Source crop: use the entire page (y=0 to y=ph). The article
     # section height controls the A4 height; the source aspect
     # controls the width (with side margins if narrower). If the
@@ -581,6 +601,73 @@ def make_a4_page_from_pdf(
     src_crop_bottom = ph
     src_crop_offset_y = src_crop_top
     article_img = primary.crop((0, src_crop_top, pw, src_crop_bottom))
+
+    # v4.5: If the "next paragraph" after Bobby Mak continues on the
+    # following PDF page (e.g. a paragraph split across a page break),
+    # the user can't see its tail. Render the next page, find where
+    # the next paragraph ends, and stitch the tail of the next page
+    # onto the bottom of article_img so the full next paragraph is
+    # visible. (See: "The next paragraph of my quote one is not
+    # shown" — the paragraph spanned two pages of the saved PDF.)
+    if bobby_mak and target_idx + 1 < len(pages):
+        try:
+            next_page = pages[target_idx + 1]
+            np_w, np_h = next_page.size
+            # Find the end of the "next paragraph" — the one
+            # immediately after Bobby's paragraph.
+            with pdfplumber.open(pdf_path) as ppdf2:
+                np_page = ppdf2.pages[target_idx + 1]
+                np_body_lines = []
+                for ln in np_page.extract_text_lines() or []:
+                    top = float(ln.get("top", 0))
+                    bottom = float(ln.get("bottom", top + 18))
+                    text = (ln.get("text") or "").strip()
+                    if text:
+                        np_body_lines.append((top, bottom, text))
+                # Where does the next paragraph end on this page?
+                # Look for a line whose top is well below the previous
+                # line's bottom (a paragraph gap > 12pt) — that's the
+                # end of the next paragraph. If no such gap, the
+                # paragraph extends to the last text line on the page.
+                next_para_end_pt = None
+                if np_body_lines:
+                    last_bottom = np_body_lines[0][1]
+                    for j, (top, bot, text) in enumerate(np_body_lines):
+                        if j > 0 and top - last_bottom > 12:
+                            # The previous paragraph (the "next
+                            # paragraph" after Bobby) ended at
+                            # last_bottom. Use that as the cut point.
+                            next_para_end_pt = last_bottom
+                            break
+                        last_bottom = bot
+                    if next_para_end_pt is None:
+                        # No paragraph break found — use the last line
+                        next_para_end_pt = np_body_lines[-1][1]
+            if next_para_end_pt is not None:
+                # Crop the next page from y=0 to y=next_para_end_pt
+                next_crop_bottom_px = min(
+                    int(next_para_end_pt / 72.0 * DPI) + 2,
+                    np_h,
+                )
+                next_page_tail = next_page.crop(
+                    (0, 0, np_w, next_crop_bottom_px)
+                )
+                # Vertically concatenate: article_img (bottom of
+                # Bobby's page) + next_page_tail (top of next page,
+                # up to the end of the next paragraph).
+                new_w = pw
+                new_h = article_img.height + next_page_tail.height
+                combined = Image.new("RGB", (new_w, new_h), "white")
+                combined.paste(article_img, (0, 0))
+                combined.paste(next_page_tail, (0, article_img.height))
+                article_img = combined
+                # Note: src_crop_offset_y stays the same (only the
+                # bottom of the source has been extended).
+                full_h_px = new_h  # for the scrollbar thumb math
+        except Exception as e:
+            # If page combining fails for any reason, fall back to
+            # the single-page article (the previous behavior).
+            print(f"    [!] page-combine skipped: {e}", flush=True)
 
     # ---- 4. Soft yellow highlight on the Bobby Mak paragraph ----
     if bobby_mak:
@@ -800,18 +887,21 @@ def make_a4_page_from_pdf(
                     article_img = article_img.crop(
                         (0, int(cut_top_in_article), a_w, a_h)
                     )
+                    a_h = article_img.height  # v4.5 bugfix: update a_h
                     bobby_y_in_scaled -= cut_top_in_article * scale
-                    new_h = max(1, int(article_img.height * scale))
+                    new_h = max(1, int(a_h * scale))
                 article_y_offset = 0
             elif article_y_offset + new_h > article_area_h:
                 # Cut the bottom of the article
                 overflow = (article_y_offset + new_h) - article_area_h
                 cut_bottom_in_article = overflow / scale
                 new_height_in_source = max(1, a_h - cut_bottom_in_article)
-                article_img = article_img.crop(
-                    (0, 0, a_w, int(new_height_in_source))
-                )
-                new_h = max(1, int(article_img.height * scale))
+                if new_height_in_source > 0:
+                    article_img = article_img.crop(
+                        (0, 0, a_w, int(new_height_in_source))
+                    )
+                    a_h = article_img.height  # v4.5 bugfix: update a_h
+                    new_h = max(1, int(a_h * scale))
                 article_y_offset = max(0, article_area_h - new_h)
         resized = article_img.resize((new_w, new_h), Image.LANCZOS)
         # Center horizontally
