@@ -767,16 +767,56 @@ def make_a4_page_from_pdf(
     # source is narrower than the section).
     a_w, a_h = article_img.size
     if a_h > 0 and a_w > 0:
-        # Scale to fit the section height — this fills the section
-        # vertically. The article may be narrower than the section
-        # (side margins) but the A4 is fully used.
-        scale = article_area_h / a_h
-        new_w = max(1, int(a_w * scale))
-        new_h = article_area_h
+        # v4.5: Scale to fit the section width so the user can place
+        # Bobby Mak anywhere in the section. Previously we scaled to
+        # the section height (which forced Bobby Mak to the natural
+        # top/bottom position); now we have a bobby_position slider.
+        scale = a4_w / a_w
+        new_w = a4_w
+        new_h = max(1, int(a_h * scale))
+        # Compute the bobby position slider value (clamped 0..1).
+        bobby_position = float(section_heights.get("bobby_position", 0.5))
+        bobby_position = max(0.0, min(1.0, bobby_position))
+        # Compute where Bobby Mak sits in the SCALED article image.
+        if bobby_mak and a_h > 0:
+            bobby_y_in_scaled = (bobby_y_px_full - src_crop_offset_y) * scale
+        else:
+            bobby_y_in_scaled = new_h * 0.5  # middle if no Bobby Mak
+        # Target Y in the article section (article_top + offset within
+        # the section).
+        target_y_in_section = article_area_h * bobby_position
+        # If the article is shorter than the section, just center it
+        # (the position slider is meaningless when the whole article
+        # is already visible). If the article is taller, position
+        # Bobby Mak at the target Y, cutting the top/bottom as needed.
+        if new_h <= article_area_h:
+            article_y_offset = (article_area_h - new_h) // 2
+        else:
+            article_y_offset = target_y_in_section - bobby_y_in_scaled
+            if article_y_offset < 0:
+                # Cut the top of the article
+                cut_top_in_article = -article_y_offset / scale
+                if cut_top_in_article < a_h:
+                    article_img = article_img.crop(
+                        (0, int(cut_top_in_article), a_w, a_h)
+                    )
+                    bobby_y_in_scaled -= cut_top_in_article * scale
+                    new_h = max(1, int(article_img.height * scale))
+                article_y_offset = 0
+            elif article_y_offset + new_h > article_area_h:
+                # Cut the bottom of the article
+                overflow = (article_y_offset + new_h) - article_area_h
+                cut_bottom_in_article = overflow / scale
+                new_height_in_source = max(1, a_h - cut_bottom_in_article)
+                article_img = article_img.crop(
+                    (0, 0, a_w, int(new_height_in_source))
+                )
+                new_h = max(1, int(article_img.height * scale))
+                article_y_offset = max(0, article_area_h - new_h)
         resized = article_img.resize((new_w, new_h), Image.LANCZOS)
         # Center horizontally
         x = max(0, (a4_w - new_w) // 2)
-        y = article_top  # top-aligned in the section
+        y = article_top + int(article_y_offset)
         border_pad = 4
         border_rect = [
             (x - border_pad, y - border_pad),
@@ -812,10 +852,12 @@ def make_a4_page_from_pdf(
             fill=(235, 235, 235),
         )
         # Thumb — proportion of visible content vs. the full page
-        visible_h_px = src_crop_bottom - src_crop_top
+        # (reflects any cut at the top/bottom from the bobby_position
+        # slider, not just the intro skip)
+        visible_h_px = max(1, src_crop_bottom - src_crop_offset_y)
         if full_h_px > 0:
             thumb_h = max(20, int(visible_h_px / full_h_px * scroll_h))
-            visible_start_in_full = src_crop_top
+            visible_start_in_full = src_crop_offset_y
             thumb_y = scroll_top + int(visible_start_in_full / full_h_px * scroll_h)
             thumb_y = max(scroll_top, min(scroll_bottom - thumb_h, thumb_y))
             draw.rectangle(
@@ -1560,6 +1602,12 @@ class ScraperGUI:
         # v4.4: how many lines of article body the title section should
         # show between the date and the scrolled-down section.
         self.intro_lines = tk.IntVar(value=3)
+        # v4.5: where in the article section the Bobby Mak paragraph
+        # should sit. 0.0 = top, 1.0 = bottom, 0.5 = middle. Lets the
+        # user see context both above and below the quote. The default
+        # is computed from the section heights so Bobby lands near the
+        # middle of the A4 page (the user said "around half of the A4").
+        self.bobby_position = tk.DoubleVar(value=self._default_bobby_position())
         self.height_preset_var = tk.StringVar(value="Balanced")
         # v4: where the GuidedManualDialog writes user-saved PDFs
         self.guided_pdfs_dir: Optional[str] = None
@@ -1738,6 +1786,35 @@ class ScraperGUI:
         ttk.Label(heights, text="(body lines between date and scroll-down)",
                   foreground="#777").grid(row=3, column=2, sticky="w", **pad)
 
+        # v4.5: Bobby Mak position within the article section. Lets
+        # the user put the quoted paragraph at the top / upper-third /
+        # middle / lower-third / bottom so they can see context both
+        # above and below the quote. 0.0 = top, 1.0 = bottom, 0.5 = middle.
+        ttk.Label(heights, text="Bobby Mak position:").grid(
+            row=4, column=0, sticky="w", **pad
+        )
+        bobby_pos_frame = ttk.Frame(heights)
+        bobby_pos_frame.grid(row=4, column=1, columnspan=2, sticky="ew", **pad)
+        self.bobby_position_scale = ttk.Scale(
+            bobby_pos_frame, from_=0.0, to=1.0, variable=self.bobby_position,
+            orient="horizontal", command=self._on_bobby_position_change,
+        )
+        self.bobby_position_scale.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.bobby_position_label = ttk.Label(
+            bobby_pos_frame, text="50% (middle)", width=14, foreground="#0066cc",
+        )
+        self.bobby_position_label.pack(side="left", padx=4)
+        ttk.Button(bobby_pos_frame, text="Top", width=5,
+                   command=lambda: self.bobby_position.set(0.0)).pack(side="left", padx=1)
+        ttk.Button(bobby_pos_frame, text="Mid", width=5,
+                   command=lambda: self.bobby_position.set(0.5)).pack(side="left", padx=1)
+        ttk.Button(bobby_pos_frame, text="Bot", width=5,
+                   command=lambda: self.bobby_position.set(1.0)).pack(side="left", padx=1)
+        ttk.Button(bobby_pos_frame, text="A4-Mid", width=7,
+                   command=lambda: self.bobby_position.set(
+                       self._default_bobby_position()
+                   )).pack(side="left", padx=1)
+
         # Preset dropdown
         ttk.Label(heights, text="Preset:").grid(row=3, column=0, sticky="w", **pad)
         preset_frame = ttk.Frame(heights)
@@ -1757,7 +1834,7 @@ class ScraperGUI:
         self.height_total_var = tk.StringVar(value="")
         ttk.Label(heights, textvariable=self.height_total_var,
                   foreground="#0066cc", font=("Consolas", 9)).grid(
-            row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0)
+            row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0)
         )
         self.root.after(50, self._on_height_change)
 
@@ -1893,6 +1970,44 @@ class ScraperGUI:
         self._on_height_change()
         self._log(f"[*] Heights filled to A4: header={header} title={title} article={article} (sum={header+title+article})")
 
+    def _default_bobby_position(self) -> float:
+        """Compute the bobby_position value that puts Bobby Mak at the
+        middle of the A4 page (y=877), based on the current section
+        heights. If the article section starts at y=article_top, then
+        bobby_position = (A4_mid - article_top) / article_area_h."""
+        try:
+            header = int(self.header_section_h.get())
+            title = int(self.title_section_h.get())
+            article = int(self.article_section_h.get())
+        except Exception:
+            return 0.5
+        article_top = header + title
+        a4_mid = A4_H_PX // 2  # 877
+        bobby_y_in_section = max(0, a4_mid - article_top)
+        # Clamp to a sensible range (0.05..0.95) so the article isn't
+        # pushed to the very edge if the title section is very tall.
+        return max(0.05, min(0.95, bobby_y_in_section / max(1, article)))
+
+    def _on_bobby_position_change(self, *_args):
+        pos = float(self.bobby_position.get())
+        a4_mid = self._default_bobby_position()
+        if pos <= 0.04:
+            label = "Top"
+        elif pos >= 0.96:
+            label = "Bottom"
+        elif abs(pos - 0.5) < 0.04:
+            label = "Middle (sec)"
+        elif abs(pos - a4_mid) < 0.04:
+            label = "A4 Middle"
+        elif pos < 0.5:
+            label = f"{int(round(pos * 100))}% (upper)"
+        else:
+            label = f"{int(round(pos * 100))}% (lower)"
+        try:
+            self.bobby_position_label.configure(text=label)
+        except Exception:
+            pass
+
     def _on_height_change(self):
         h = self.header_section_h.get()
         t = self.title_section_h.get()
@@ -1912,6 +2027,12 @@ class ScraperGUI:
             self.height_total_var.set(msg)
         except Exception:
             pass
+        # Refresh the bobby position label too (the "A4 Middle" value
+        # changes with the section heights).
+        try:
+            self._on_bobby_position_change()
+        except Exception:
+            pass
 
     def _resolve_header_path(self) -> Optional[str]:
         if not self.use_header_var.get():
@@ -1929,6 +2050,7 @@ class ScraperGUI:
             "title": int(self.title_section_h.get()),
             "article": int(self.article_section_h.get()),
             "intro_lines": int(self.intro_lines.get()),
+            "bobby_position": float(self.bobby_position.get()),
         }
 
     def _on_mode_change(self):
@@ -2461,6 +2583,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "scrolled-down section (default: 3)"
     )
     ap.add_argument(
+        "--bobby-position", type=float, default=0.5,
+        help="Where the Bobby Mak paragraph sits in the article "
+             "section: 0.0 = top, 1.0 = bottom, 0.5 = middle (default: 0.5)"
+    )
+    ap.add_argument(
         "--gui",
         action="store_true",
         help="Force the GUI even when other args are given (rarely needed)",
@@ -2493,6 +2620,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "title": args.section_title,
         "article": args.section_article,
         "intro_lines": args.intro_lines,
+        "bobby_position": args.bobby_position,
     }
     if not args.no_header:
         if args.header and os.path.exists(args.header):
