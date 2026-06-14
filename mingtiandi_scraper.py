@@ -669,6 +669,55 @@ def make_a4_page_from_pdf(
             # the single-page article (the previous behavior).
             print(f"    [!] page-combine skipped: {e}", flush=True)
 
+    # v4.6: Erase the GDPR cookies-consent banner. It's a fixed
+    # overlay on the bottom of every page; without this erase, the
+    # banner sits between the Bobby Mak paragraph and the next
+    # paragraph's continuation, which the user finds jarring. We
+    # detect it by keyword ("cookies", "Privacy policy", "consent
+    # to the policy") and cover the line band with white. (The
+    # banner sits on top of the article body in the source PDF,
+    # so any article text it covers is lost — but the banner is
+    # not article content, so removing it is the right call.)
+    try:
+        _DRAW = ImageDraw.Draw(article_img)
+        with pdfplumber.open(pdf_path) as _ppdf_cc:
+            _cc_page = _ppdf_cc.pages[target_idx]
+            _cc_h_pt = _cc_page.height
+            for _cc_ln in (_cc_page.extract_text_lines() or []):
+                _cc_top = float(_cc_ln.get("top", 0))
+                _cc_bot = float(_cc_ln.get("bottom", _cc_top + 18))
+                _cc_txt = (_cc_ln.get("text") or "").strip()
+                # Cookies banner lives in the bottom 25% of the
+                # page and contains one of these keywords. Restrict
+                # the y-range so we don't catch article paragraphs
+                # that happen to mention "privacy" or "consent".
+                if _cc_top < _cc_h_pt * 0.70:
+                    continue
+                if not any(
+                    kw in _cc_txt.lower()
+                    for kw in (
+                        "cookies in accordance",
+                        "privacy policy",
+                        "consent to the policy",
+                        "by continuing to browse",
+                    )
+                ):
+                    continue
+                # Convert pt to article_img y-coords (article_img
+                # was cropped at src_crop_top, so subtract it).
+                _y0 = max(0, int(_cc_top / 72.0 * DPI) - src_crop_offset_y - 2)
+                _y1 = min(
+                    article_img.height,
+                    int(_cc_bot / 72.0 * DPI) - src_crop_offset_y + 2,
+                )
+                if _y1 > _y0:
+                    _DRAW.rectangle(
+                        [(0, _y0), (article_img.width, _y1)],
+                        fill=(255, 255, 255),
+                    )
+    except Exception as _e:
+        print(f"    [!] cookies-banner erase skipped: {_e}", flush=True)
+
     # ---- 4. Soft yellow highlight on the Bobby Mak paragraph ----
     if bobby_mak:
         bobby_y_px_in_cropped = bobby_y_px_full - src_crop_offset_y
